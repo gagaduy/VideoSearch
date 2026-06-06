@@ -1,0 +1,7 @@
+[
+  {
+    "query": "frame placeholder",
+    "object_labels": [],
+    "expected_segment_ids": [1]
+  }
+]

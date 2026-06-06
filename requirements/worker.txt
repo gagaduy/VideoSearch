@@ -1,0 +1,14 @@
+open-clip-torch==3.0.0
+ultralytics==8.3.163
+pillow==11.3.0
+opencv-python-headless==4.11.0.86
+imagehash==4.3.2
+pytesseract==0.3.13
+paddlepaddle==3.0.0
+paddleocr==2.8.1
+transformers==4.48.3
+accelerate==1.13.0
+sentencepiece==0.2.1
+einops==0.8.2
+bitsandbytes==0.49.2
+torchvision==0.27.0

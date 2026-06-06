@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Video Retrieval</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <p class="eyebrow">Multimodal Retrieval</p>
+        <h1>Video Retrieval</h1>
+        <p class="summary">Upload videos, index keyframes, expand queries, and inspect timeline-aware search results.</p>
+      </header>
+
+      <section class="panel">
+        <h2>Ingest</h2>
+        <form id="upload-form" class="stack">
+          <input id="video-file" name="file" type="file" accept="video/*" required>
+          <input id="video-filename" name="filename" placeholder="Selected file" readonly>
+          <button type="submit">Create Index Job</button>
+        </form>
+        <section id="job-status" class="job-status" hidden>
+          <div class="job-status-row">
+            <strong id="job-status-label">Waiting</strong>
+            <span id="job-stage-label">queued</span>
+          </div>
+          <div class="progress-track" aria-hidden="true">
+            <div id="job-progress-bar" class="progress-bar"></div>
+          </div>
+        </section>
+        <pre id="job-output"></pre>
+      </section>
+
+      <section class="panel">
+        <h2>Search</h2>
+        <form id="search-form" class="stack">
+          <input id="query" name="query" placeholder="man fixing car">
+          <input id="object-labels" name="object_labels" placeholder="car,person">
+          <button type="submit">Search</button>
+        </form>
+        <section id="results"></section>
+      </section>
+
+      <section class="panel">
+        <h2>Timeline Preview</h2>
+        <section id="timeline-preview">No result selected.</section>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
