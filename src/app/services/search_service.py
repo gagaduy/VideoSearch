@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db.repositories.search import create_query_log, fetch_frame_media_map
 from app.services.local_rerank import score_local_candidate
+from app.services.object_refinement import refine_object_matches
 from app.services.query_expansion import expand_query
 from app.services.query_rerank import rerank_structured_candidates
 from app.services.query_understanding import ObjectFilter, StructuredQuery, TemporalStep, parse_structured_query
@@ -261,6 +262,17 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
         db,
         [int(row["keyframe_id"]) for row in rows if row["keyframe_id"] is not None],
     )
+    refinement_scores: dict[int, float] = {}
+    query_object_terms = [item.label for item in object_filters]
+    if query_object_terms:
+        candidate_frames = []
+        for row in sorted(rows, key=lambda item: fused_scores.get(int(item["segment_id"]), 0.0), reverse=True)[:12]:
+            keyframe_id = int(row["keyframe_id"]) if row["keyframe_id"] is not None else None
+            media = frame_media.get(keyframe_id or -1, {})
+            image_path = str(media.get("image_path", "")).strip()
+            if keyframe_id is not None and image_path:
+                candidate_frames.append({"frame_id": keyframe_id, "image_path": image_path})
+        refinement_scores = refine_object_matches(candidate_frames, query_object_terms)
 
     filtered_segment_ids = {segment_id for segment_id, passed in passes_filters.items() if passed}
     enforce_hard_filter = bool(object_filters and filtered_segment_ids)
@@ -314,6 +326,7 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
                 "preview_url": f"/media/frames/{keyframe_id}/preview" if keyframe_id is not None and media else "",
                 "diagnostics": {
                     **diagnostics.get(segment_id, {}),
+                    "object_refinement_score": refinement_scores.get(keyframe_id or -1, 0.0),
                     "llm_alignment_score": llm_alignment_scores.get(segment_id, 0.0),
                     "constraint_mode": "hard" if enforce_hard_filter else "soft",
                 },
@@ -328,7 +341,10 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
             "dense_score": fused_scores.get(segment_id, 0.0),
             "text_score": diagnostics.get(segment_id, {}).get("text_score", 0.0),
             "ocr_score": _lexical_score(text_terms, str(item["caption"])) if item["caption"] else 0.0,
-            "object_score": diagnostics.get(segment_id, {}).get("object_score", 0.0),
+            "object_score": max(
+                diagnostics.get(segment_id, {}).get("object_score", 0.0),
+                refinement_scores.get(int(item.get("frame_id") or -1), 0.0),
+            ),
             "entity_score": _entity_score(rows_by_segment[segment_id], text_terms),
             "temporal_score": temporal_bonus.get(segment_id, 0.0),
             "hard_constraints_passed": passes_filters.get(segment_id, True) if enforce_hard_filter else True,

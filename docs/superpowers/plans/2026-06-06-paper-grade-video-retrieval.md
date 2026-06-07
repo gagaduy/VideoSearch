@@ -25,9 +25,11 @@
 - `src/app/services/query_understanding.py`
   Strengthen deterministic local parsing and make hard vs soft constraints explicit.
 - `src/worker/pipeline.py`
-  Rewrite indexing flow to produce multi-view segment artifacts and per-stage failure state.
+  Rewrite indexing flow to produce multi-view segment artifacts, `YOLO-World` ontology detections, and per-stage failure state.
 - `src/worker/adapters/openclip_adapter.py`
   Upgrade default model configuration and expose pooled/keyframe embedding helpers.
+- `src/worker/adapters/yolo_adapter.py`
+  Replace closed-set YOLO behavior with `YOLO-World` prompt-driven detection.
 - `src/worker/adapters/paddleocr_adapter.py`
   Replace tesseract behavior with PaddleOCR behavior and normalized output.
 - `tests/unit/test_query_understanding.py`
@@ -45,6 +47,8 @@
   Dense branch retrieval, text branch retrieval, object/entity branch retrieval, and branch diagnostics.
 - `src/app/services/retrieval_branches.py`
   Query-to-branch execution helpers.
+- `src/app/services/object_refinement.py`
+  Query-conditioned `YOLO-World` verification on top candidate keyframes.
 - `src/app/services/retrieval_fusion.py`
   Reciprocal-rank fusion, normalized weighting, and hard-constraint penalties.
 - `src/app/services/temporal_paths.py`
@@ -55,6 +59,8 @@
   Secondary semantic branch adapter or semantic-enrichment adapter for branch B.
 - `src/worker/adapters/paddleocr_normalize.py`
   OCR normalization helpers.
+- `src/worker/retrieval_ontology.py`
+  Shared retrieval vocabulary and alias lists used by `YOLO-World`.
 - `tests/unit/test_retrieval_branches.py`
   Branch candidate generation tests.
 - `tests/unit/test_retrieval_fusion.py`
@@ -65,6 +71,10 @@
   Final local rerank tests.
 - `tests/unit/test_paddleocr_normalize.py`
   OCR normalization tests.
+- `tests/unit/test_yolo_world_adapter.py`
+  Open-vocabulary detector tests and prompt handling.
+- `tests/unit/test_retrieval_ontology.py`
+  Ontology normalization and alias tests.
 - `tests/integration/test_branch_retrieval.py`
   Multi-branch candidate generation integration tests.
 - `tests/integration/test_temporal_retrieval.py`
@@ -273,6 +283,8 @@ Expected: PASS
 - Modify: `src/worker/pipeline.py`
 - Modify: `src/worker/adapters/openclip_adapter.py`
 - Create: `src/worker/adapters/internvl_adapter.py`
+- Modify: `src/worker/adapters/yolo_adapter.py`
+- Create: `src/worker/retrieval_ontology.py`
 - Modify: `tests/unit/test_worker_pipeline_io.py`
 - Modify: `tests/unit/test_worker_tasks.py`
 - Modify: `tests/integration/test_index_job_flow.py`
@@ -702,6 +714,151 @@ def evaluate_queries(queries: list[dict[str, object]]) -> dict[str, float]:
 Run: `pytest tests/integration/test_branch_retrieval.py -v`
 Expected: PASS
 
+### Task 9: Replace Closed-Set Detection With YOLO-World
+
+**Files:**
+- Create: `src/worker/retrieval_ontology.py`
+- Modify: `src/worker/adapters/yolo_adapter.py`
+- Modify: `src/worker/pipeline.py`
+- Create: `src/app/services/object_refinement.py`
+- Modify: `src/app/services/search_service.py`
+- Create: `tests/unit/test_retrieval_ontology.py`
+- Create: `tests/unit/test_yolo_world_adapter.py`
+- Modify: `tests/integration/test_real_pipeline.py`
+- Modify: `tests/integration/test_search_api.py`
+
+- [ ] **Step 1: Write failing ontology tests**
+
+```python
+from worker.retrieval_ontology import build_indexing_prompts, normalize_query_object_terms
+
+
+def test_build_indexing_prompts_contains_background_and_aliases():
+    prompts = build_indexing_prompts()
+    assert "person" in prompts
+    assert "vehicle" in prompts
+    assert "" in prompts
+
+
+def test_normalize_query_object_terms_maps_aliases_to_canonical_terms():
+    assert normalize_query_object_terms(["automobile", "ship"]) == ["car", "boat"]
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `pytest tests/unit/test_retrieval_ontology.py -v`
+Expected: FAIL because the ontology module does not exist.
+
+- [ ] **Step 3: Add retrieval ontology helpers**
+
+```python
+CANONICAL_OBJECTS = {
+    "car": ["automobile", "vehicle"],
+    "boat": ["ship"],
+    "person": ["human", "man", "woman"],
+}
+
+
+def build_indexing_prompts() -> list[str]:
+    prompts = sorted({name for key, values in CANONICAL_OBJECTS.items() for name in [key, *values]})
+    return [*prompts, ""]
+
+
+def normalize_query_object_terms(terms: list[str]) -> list[str]:
+    normalized = []
+    for term in terms:
+        lower = term.lower()
+        canonical = next((key for key, values in CANONICAL_OBJECTS.items() if lower == key or lower in values), lower)
+        if canonical not in normalized:
+            normalized.append(canonical)
+    return normalized
+```
+
+- [ ] **Step 4: Write failing YOLO-World adapter tests**
+
+```python
+from worker.adapters.yolo_adapter import YoloDetectionAdapter
+
+
+def test_yolo_world_adapter_sets_prompt_classes(monkeypatch):
+    calls = {}
+
+    class _World:
+        def __init__(self, model_name):
+            calls["model_name"] = model_name
+
+        def set_classes(self, classes):
+            calls["classes"] = classes
+
+        def predict(self, source, verbose=False):
+            return []
+
+    monkeypatch.setattr("worker.adapters.yolo_adapter.YOLOWorld", _World)
+    adapter = YoloDetectionAdapter(model_name="yolov8s-worldv2.pt")
+    adapter.detect("frame.png", classes=["boat", "person"])
+
+    assert calls["model_name"] == "yolov8s-worldv2.pt"
+    assert calls["classes"] == ["boat", "person"]
+```
+
+- [ ] **Step 5: Run tests to verify they fail**
+
+Run: `pytest tests/unit/test_yolo_world_adapter.py -v`
+Expected: FAIL because the adapter does not expose `YOLO-World` prompt-driven behavior yet.
+
+- [ ] **Step 6: Rewrite the detector adapter around YOLO-World**
+
+```python
+from ultralytics import YOLOWorld
+
+
+class YoloDetectionAdapter:
+    def __init__(self, model_name: str | None = None) -> None:
+        self.model_name = model_name or "yolov8s-worldv2.pt"
+        self._model = None
+
+    def _lazy_load(self):
+        if self._model is None:
+            self._model = YOLOWorld(self.model_name)
+        return self._model
+
+    def detect(self, image_path: str, classes: list[str] | None = None) -> list[dict[str, object]]:
+        model = self._lazy_load()
+        prompts = classes or build_indexing_prompts()
+        model.set_classes(prompts)
+        results = model.predict(source=image_path, verbose=False)
+        ...
+```
+
+- [ ] **Step 7: Update worker indexing to use ontology prompts**
+
+```python
+objects = detector.detect(image_path, classes=build_indexing_prompts())
+segment.raw_json["object_prompt_set"] = build_indexing_prompts()
+segment.raw_json["object_detector_family"] = "yolo_world"
+```
+
+- [ ] **Step 8: Add query-conditioned refinement service**
+
+```python
+def refine_object_matches(image_paths: list[str], query_terms: list[str]) -> dict[int, float]:
+    prompts = normalize_query_object_terms(query_terms)
+    ...
+```
+
+- [ ] **Step 9: Wire refinement into search scoring**
+
+```python
+if query_object_terms:
+    refinement_scores = refine_object_matches(candidate_frame_paths, query_object_terms)
+    item["object_score"] = max(item["object_score"], refinement_scores.get(item["frame_id"], 0.0))
+```
+
+- [ ] **Step 10: Run targeted YOLO-World tests**
+
+Run: `pytest tests/unit/test_retrieval_ontology.py tests/unit/test_yolo_world_adapter.py tests/integration/test_real_pipeline.py tests/integration/test_search_api.py -v`
+Expected: PASS
+
 ## Self-Review Checklist
 
 - Spec coverage:
@@ -711,9 +868,9 @@ Expected: PASS
   - temporal path retrieval: Task 6
   - OpenAI as optional enhancement: Task 7
   - evaluation harness: Task 8
+  - YOLO-World open-vocabulary object branch: Task 9
 - Placeholder scan:
   - no `TODO`, `TBD`, or “implement later” text remains
   - each test and implementation step includes concrete commands or code
 - Type consistency:
   - `embedding_branch_a`, `embedding_branch_b`, `ocr_tokens_json`, and `stage_failures_json` are used consistently across schema, worker, and retrieval tasks
-

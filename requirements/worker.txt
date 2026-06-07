@@ -1,5 +1,6 @@
 open-clip-torch==3.0.0
 ultralytics==8.3.163
+git+https://github.com/ultralytics/CLIP.git
 pillow==11.3.0
 opencv-python-headless==4.11.0.86
 imagehash==4.3.2

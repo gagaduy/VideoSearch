@@ -14,6 +14,7 @@ from worker.adapters.paddleocr_adapter import PaddleOcrAdapter
 from worker.adapters.semantic_entity_adapter import SemanticEntityAdapter
 from worker.adapters.yolo_adapter import YoloDetectionAdapter
 from worker.io import copy_or_create_thumbnail, extract_frames_ffmpeg, write_placeholder_image
+from worker.retrieval_ontology import build_indexing_prompts
 from worker.sampling import keep_distinct_frames
 
 SEGMENT_DISTANCE_THRESHOLD = 0.28
@@ -74,6 +75,13 @@ def _mean_vector(vectors: list[list[float]]) -> list[float]:
     return [value / norm for value in averaged]
 
 
+def _optional_mean_vector(vectors: list[list[float]]) -> list[float] | None:
+    non_empty = [vector for vector in vectors if vector]
+    if not non_empty:
+        return None
+    return _mean_vector(non_empty)
+
+
 def _unique_text(items: list[str]) -> str:
     seen: list[str] = []
     for item in items:
@@ -81,6 +89,31 @@ def _unique_text(items: list[str]) -> str:
         if normalized and normalized not in seen:
             seen.append(normalized)
     return " ".join(seen)
+
+
+def _build_lightweight_caption(objects: list[dict[str, object]], ocr_text: str) -> str:
+    labels = [str(item.get("label", "")).strip().lower() for item in objects if str(item.get("label", "")).strip()]
+    return _unique_text([*labels, ocr_text.strip().lower()])
+
+
+def _should_run_vlm_enrichment(
+    *,
+    segment_index: int,
+    segment_count: int,
+    profile: str,
+    sparse_stride: int,
+    ocr_text: str,
+    objects: list[dict[str, object]],
+) -> bool:
+    normalized_profile = profile.strip().lower()
+    if normalized_profile == "full":
+        return True
+    if not ocr_text.strip() or not objects:
+        return True
+    if segment_index == 1 or segment_index == segment_count:
+        return True
+    stride = max(sparse_stride, 1)
+    return ((segment_index - 1) % stride) == 0
 
 
 def _object_counts(objects: list[dict[str, object]]) -> dict[str, int]:
@@ -154,6 +187,94 @@ def _clear_video_index(db: Session, video_id: int) -> None:
     db.commit()
 
 
+def index_prepared_frames(
+    db: Session,
+    video_id: int,
+    frame_sources: list[dict[str, object]],
+    *,
+    openclip: OpenClipAdapter,
+    captioner: CaptionAdapter,
+    ocr_engine: PaddleOcrAdapter,
+    detector: YoloDetectionAdapter,
+    entity_extractor: SemanticEntityAdapter,
+    branch_b_adapter: InternvlAdapter,
+    job_id: int | None = None,
+    source_tag: str = "prepared_frames",
+) -> dict[str, object]:
+    _clear_video_index(db, video_id)
+    _update_job_stage(db, job_id, status="running", stage=f"embedding_frames:0/{len(frame_sources)}")
+
+    frame_items: list[dict[str, object]] = []
+    last_embedding: list[float] = []
+
+    for index, frame_source in enumerate(frame_sources, start=1):
+        frame_path = Path(str(frame_source["image_path"]))
+        timestamp_sec = float(frame_source.get("timestamp_sec", index - 1))
+        frame_index = int(frame_source.get("frame_index", index))
+        thumb_path = Path(settings.thumbs_dir) / f"video_{video_id}" / f"{frame_path.stem}.webp"
+        copy_or_create_thumbnail(frame_path, thumb_path)
+
+        embedding = openclip.embed_image(str(frame_path))
+
+        frame = Frame(
+            video_id=video_id,
+            timestamp_sec=timestamp_sec,
+            frame_index=frame_index,
+            image_path=str(frame_path),
+            thumb_path=str(thumb_path),
+            is_keyframe=True,
+        )
+        db.add(frame)
+        db.flush()
+        db.add(FrameEmbedding(frame_id=frame.id, model_name=embedding.model_name, embedding=embedding.values))
+
+        frame_items.append(
+            {
+                "frame_id": int(frame.id),
+                "timestamp_sec": float(frame.timestamp_sec),
+                "embedding_branch_a": list(embedding.values),
+                "embedding_branch_b": [],
+            }
+        )
+        last_embedding = embedding.values
+        if job_id is not None:
+            job = db.get(IndexJob, job_id)
+            if job is not None:
+                job.status = "running"
+                job.stage = f"embedding_frames:{index}/{len(frame_sources)}"
+        db.commit()
+
+    _update_job_stage(db, job_id, status="running", stage="building_segments")
+    segments = _persist_segments(db, video_id, frame_items)
+    _update_job_stage(db, job_id, status="running", stage=f"enriching_segments:0/{len(segments)}")
+    last_caption, last_ocr, last_objects = _enrich_segment_keyframes(
+        db,
+        segments,
+        captioner=captioner,
+        ocr_engine=ocr_engine,
+        detector=detector,
+        entity_extractor=entity_extractor,
+        branch_b_adapter=branch_b_adapter,
+        dense_encoder=openclip,
+        job_id=job_id,
+    )
+    for segment in segments:
+        segment.raw_json = {
+            **dict(segment.raw_json or {}),
+            "dataset": source_tag,
+        }
+    db.commit()
+
+    return {
+        "frame_count": len(frame_sources),
+        "segment_count": len(segments),
+        "embedding": last_embedding,
+        "caption": last_caption,
+        "ocr": last_ocr,
+        "objects": last_objects,
+    }
+
+
 def _persist_segments(db: Session, video_id: int, frame_items: list[dict[str, object]]) -> list[Segment]:
     persisted_segments: list[Segment] = []
     for segment_index, items in enumerate(_build_segments(frame_items), start=1):
@@ -173,9 +294,9 @@ def _persist_segments(db: Session, video_id: int, frame_items: list[dict[str, ob
             semantic_entities_json=[],
             semantic_aliases_json={},
             semantic_counts_json={},
-            embedding=_mean_vector([list(item["embedding_branch_a"]) for item in items]),
-            embedding_branch_a=_mean_vector([list(item["embedding_branch_a"]) for item in items]),
-            embedding_branch_b=_mean_vector([list(item["embedding_branch_b"]) for item in items]),
+            embedding=_optional_mean_vector([list(item["embedding_branch_a"]) for item in items]),
+            embedding_branch_a=_optional_mean_vector([list(item["embedding_branch_a"]) for item in items]),
+            embedding_branch_b=_optional_mean_vector([list(item["embedding_branch_b"]) for item in items]),
             stage_failures_json={},
             raw_json={
                 "frame_ids": [int(item["frame_id"]) for item in items],
@@ -208,6 +329,7 @@ def _enrich_segment_keyframes(
     last_caption = ""
     last_ocr = ""
     last_objects: list[dict[str, object]] = []
+    object_prompts = build_indexing_prompts()
 
     for index, segment in enumerate(segments, start=1):
         frame = db.get(Frame, int(segment.keyframe_id))
@@ -218,34 +340,96 @@ def _enrich_segment_keyframes(
         stage_failures: dict[str, str] = {}
 
         try:
-            caption = captioner.caption(image_path)
-        except Exception as exc:
-            caption = {"caption": "", "model_name": "error", "confidence": 0.0}
-            stage_failures["caption"] = str(exc)
-
-        try:
             ocr = ocr_engine.extract_text(image_path)
         except Exception as exc:
             ocr = {"text": "", "tokens": [], "raw": []}
             stage_failures["ocr"] = str(exc)
 
         try:
-            objects = detector.detect(image_path)
+            objects = detector.detect(image_path, classes=object_prompts)
         except Exception as exc:
             objects = []
             stage_failures["detector"] = str(exc)
+        object_positions = _object_positions(objects, image_path)
+
+        use_vlm = _should_run_vlm_enrichment(
+            segment_index=index,
+            segment_count=len(segments),
+            profile=settings.indexing_profile,
+            sparse_stride=settings.internvl_sparse_stride,
+            ocr_text=str(ocr["text"]),
+            objects=objects,
+        )
+
+        branch_b: dict[str, object] = {"caption": "", "tags": [], "entities": [], "model_name": ""}
+        if use_vlm:
+            try:
+                branch_b = branch_b_adapter.describe_image(image_path)
+            except Exception as exc:
+                branch_b = {"caption": "", "tags": [], "entities": [], "model_name": "error"}
+                stage_failures["branch_b"] = str(exc)
 
         try:
-            semantic = entity_extractor.extract(image_path, str(caption["caption"]), str(ocr["text"]))
+            if branch_b.get("caption"):
+                caption = {
+                    "caption": str(branch_b["caption"]),
+                    "model_name": str(branch_b.get("model_name", "internvl")),
+                    "confidence": 0.9,
+                }
+            elif use_vlm:
+                caption = captioner.caption(image_path)
+            else:
+                caption = {
+                    "caption": _build_lightweight_caption(objects, str(ocr["text"])),
+                    "model_name": "balanced-heuristic",
+                    "confidence": 0.35,
+                }
+        except Exception as exc:
+            caption = {"caption": "", "model_name": "error", "confidence": 0.0}
+            stage_failures["caption"] = str(exc)
+
+        try:
+            if branch_b.get("entities"):
+                normalized_entities: list[dict[str, object]] = []
+                semantic_counts: dict[str, int] = {}
+                for item in branch_b.get("entities", []):
+                    label = str(item.get("label", "")).strip().lower()
+                    if not label:
+                        continue
+                    aliases = [str(alias).strip().lower() for alias in item.get("aliases", []) if str(alias).strip()]
+                    normalized_entities.append(
+                        {
+                            "label": label,
+                            "count": 1,
+                            "aliases": aliases,
+                            "regions": [],
+                            "attributes": [str(attr).strip().lower() for attr in item.get("attributes", []) if str(attr).strip()],
+                        }
+                    )
+                    semantic_counts[label] = max(semantic_counts.get(label, 0), 1)
+                    for alias in aliases:
+                        semantic_counts[alias] = max(semantic_counts.get(alias, 0), 1)
+                semantic = {"entities": normalized_entities, "counts": semantic_counts}
+            elif use_vlm:
+                semantic = entity_extractor.extract(image_path, str(caption["caption"]), str(ocr["text"]))
+            else:
+                semantic_counts = {label: count for label, count in _object_counts(objects).items()}
+                semantic = {
+                    "entities": [
+                        {
+                            "label": label,
+                            "count": count,
+                            "aliases": [],
+                            "regions": list(object_positions.get(label, [])),
+                            "attributes": [],
+                        }
+                        for label, count in semantic_counts.items()
+                    ],
+                    "counts": semantic_counts,
+                }
         except Exception as exc:
             semantic = {"entities": [], "counts": {}}
             stage_failures["semantic_entities"] = str(exc)
-
-        try:
-            branch_b = branch_b_adapter.describe_image(image_path)
-        except Exception as exc:
-            branch_b = {"caption": "", "tags": [], "entities": [], "model_name": "error"}
-            stage_failures["branch_b"] = str(exc)
 
         db.add(
             FrameCaption(
@@ -281,7 +465,7 @@ def _enrich_segment_keyframes(
         counts = _object_counts(objects)
         segment.object_labels_json = sorted(counts)
         segment.object_counts_json = counts
-        segment.object_positions_json = _object_positions(objects, image_path)
+        segment.object_positions_json = object_positions
         segment.semantic_entities_json = list(semantic.get("entities", []))
         segment.semantic_aliases_json = {
             str(item.get("label", "")).strip().lower(): [
@@ -303,6 +487,11 @@ def _enrich_segment_keyframes(
         if branch_b_text:
             segment.embedding_branch_b = dense_encoder.embed_text(branch_b_text).values
         segment.stage_failures_json = stage_failures
+        segment.raw_json = {
+            **dict(segment.raw_json or {}),
+            "object_prompt_set": object_prompts,
+            "object_detector_family": "yolo_world",
+        }
 
         last_caption = str(caption["caption"])
         last_ocr = str(ocr["text"])
@@ -324,8 +513,6 @@ def run_index_pipeline(db: Session, video_id: int, job_id: int | None = None) ->
 
     ensure_data_dirs()
     source_path = Path(video.source_path)
-    _clear_video_index(db, video_id)
-    _update_job_stage(db, job_id, status="running", stage="extracting_frames")
     openclip = OpenClipAdapter()
     captioner = CaptionAdapter()
     ocr_engine = PaddleOcrAdapter()
@@ -333,62 +520,25 @@ def run_index_pipeline(db: Session, video_id: int, job_id: int | None = None) ->
     entity_extractor = SemanticEntityAdapter()
     branch_b_adapter = InternvlAdapter()
 
+    _update_job_stage(db, job_id, status="running", stage="extracting_frames")
     frame_paths = keep_distinct_frames(_prepare_frame_paths(video_id, source_path), distance_threshold=8)
     if not frame_paths:
         raise RuntimeError(f"no frames extracted for video {video_id}")
-    _update_job_stage(db, job_id, status="running", stage=f"embedding_frames:0/{len(frame_paths)}")
-
-    frame_items: list[dict[str, object]] = []
-    last_embedding: list[float] = []
-
-    for index, frame_path in enumerate(frame_paths, start=1):
-        thumb_path = Path(settings.thumbs_dir) / f"video_{video_id}" / f"{frame_path.stem}.webp"
-        copy_or_create_thumbnail(frame_path, thumb_path)
-
-        embedding = openclip.embed_image(str(frame_path))
-
-        frame = Frame(
-            video_id=video_id,
-            timestamp_sec=float(index - 1),
-            frame_index=index,
-            image_path=str(frame_path),
-            thumb_path=str(thumb_path),
-            is_keyframe=True,
-        )
-        db.add(frame)
-        db.flush()
-        db.add(FrameEmbedding(frame_id=frame.id, model_name=embedding.model_name, embedding=embedding.values))
-
-        frame_items.append(
-            {
-                "frame_id": int(frame.id),
-                "timestamp_sec": float(frame.timestamp_sec),
-                "embedding_branch_a": list(embedding.values),
-                "embedding_branch_b": [],
-            }
-        )
-
-        last_embedding = embedding.values
-        if job_id is not None:
-            job = db.get(IndexJob, job_id)
-            if job is not None:
-                job.status = "running"
-                job.stage = f"embedding_frames:{index}/{len(frame_paths)}"
-        db.commit()
-
-    _update_job_stage(db, job_id, status="running", stage="building_segments")
-    segments = _persist_segments(db, video_id, frame_items)
-    _update_job_stage(db, job_id, status="running", stage=f"enriching_segments:0/{len(segments)}")
-    last_caption, last_ocr, last_objects = _enrich_segment_keyframes(
+    payload = index_prepared_frames(
         db,
-        segments,
+        video_id,
+        [
+            {"image_path": str(frame_path), "timestamp_sec": float(index - 1), "frame_index": index}
+            for index, frame_path in enumerate(frame_paths, start=1)
+        ],
+        openclip=openclip,
         captioner=captioner,
         ocr_engine=ocr_engine,
         detector=detector,
         entity_extractor=entity_extractor,
         branch_b_adapter=branch_b_adapter,
-        dense_encoder=openclip,
         job_id=job_id,
+        source_tag="video_extract",
     )
     video.status = "indexed"
     if job_id is not None:
@@ -397,13 +547,4 @@ def run_index_pipeline(db: Session, video_id: int, job_id: int | None = None) ->
             job.status = "completed"
             job.stage = "done"
     db.commit()
-
-    return {
-        "video_id": video_id,
-        "frame_count": len(frame_paths),
-        "segment_count": len(segments),
-        "embedding": last_embedding,
-        "caption": last_caption,
-        "ocr": last_ocr,
-        "objects": last_objects,
-    }
+    return {"video_id": video_id, **payload}

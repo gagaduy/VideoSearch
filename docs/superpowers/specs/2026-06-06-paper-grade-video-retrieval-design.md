@@ -131,17 +131,19 @@ This branch is required to move the system closer to the paper’s multi-model f
 
 ### Object Detection
 
-- Primary choice: stronger YOLO variant such as `yolo11l` or `yolo11x`
+- Primary choice: `YOLO-World` with a hybrid prompt strategy
 - Purpose:
-  support object presence, count, and coarse position constraints
+  support open-vocabulary object presence, count, coarse position constraints, and query-aware verification
 - Indexed outputs:
   - label
   - confidence
   - bbox
   - count per segment
   - region map per segment
+  - detector family
+  - prompt source metadata
 
-Current small-detector quality is not sufficient for the target.
+The detector must not remain limited to closed-set COCO labels if the system is intended to approach paper-grade retrieval behavior.
 
 ### OCR
 
@@ -202,6 +204,8 @@ For each segment, persist:
 - object detections
 - object counts
 - object regions
+- object detector family
+- object prompt set metadata
 - semantic entities
 - semantic aliases
 - temporal neighbor references
@@ -248,6 +252,12 @@ The system retrieves candidates independently from:
 
 Each branch returns top-K candidates with branch-specific diagnostics.
 
+For the object branch specifically:
+
+- offline object evidence comes from `YOLO-World` with a retrieval ontology prompt set
+- online refinement can run `YOLO-World` again on top candidate keyframes using query-conditioned prompts
+- query-conditioned verification is only applied when the query shows strong object intent or hard count/region constraints
+
 ### 3. Fusion
 
 Fusion combines branch results using:
@@ -283,6 +293,11 @@ Before any OpenAI call, the engine computes a final local score from:
 - temporal-path quality
 
 This local rerank is the real backbone of accuracy.
+
+For object-heavy queries, the reranker must be able to incorporate both:
+
+- offline ontology-based object scores
+- query-conditioned `YOLO-World` verification scores
 
 ### 6. Optional OpenAI Rerank
 
@@ -341,7 +356,7 @@ Extend the schema to support:
 Replace or upgrade:
 
 - current OCR adapter
-- current detector tier
+- current detector tier with `YOLO-World`
 - current segment builder
 - current semantic enrichment contract
 
@@ -393,12 +408,13 @@ Highest priority:
 1. replace OCR with PaddleOCR
 2. upgrade main dense branch to OpenCLIP H/14
 3. redesign schema for multi-branch segment retrieval
-4. rewrite search into explicit multi-branch fusion
-5. replace temporal bonus with temporal path retrieval
+4. replace closed-set object detection with `YOLO-World` ontology indexing
+5. rewrite search into explicit multi-branch fusion
+6. replace temporal bonus with temporal path retrieval
 
 Second priority:
 
-1. add stronger object detector tier
+1. add query-conditioned `YOLO-World` refinement on top candidates
 2. add secondary semantic branch from InternVL-style enrichment
 3. add local final reranker
 4. add optional OpenAI top-K rerank

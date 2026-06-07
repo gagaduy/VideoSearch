@@ -1,12 +1,11 @@
 from sqlalchemy import select
 
 from app.db.models import IndexJob
-from app.db.session import get_session_factory, init_db
+from app.db.session import get_session_factory
 from app.services.job_service import run_job
 
 
 def run_pending_jobs() -> dict[str, object]:
-    init_db()
     session = get_session_factory()()
     try:
         pending_jobs = session.scalars(

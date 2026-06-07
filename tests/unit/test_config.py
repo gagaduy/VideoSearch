@@ -19,4 +19,6 @@ def test_settings_defaults_use_local_paths(tmp_path: Path) -> None:
     assert settings.thumbs_dir == tmp_path / "data" / "thumbs"
     assert settings.internvl_model == "OpenGVLab/InternVL2_5-1B"
     assert settings.internvl_use_8bit is True
-    assert settings.yolo_model == "yolo11l.pt"
+    assert settings.indexing_profile == "balanced"
+    assert settings.internvl_sparse_stride == 3
+    assert settings.yolo_model == "yolov8s-worldv2.pt"
