@@ -130,6 +130,13 @@ If filtering removes all results, the response should still succeed with an empt
 
 The frontend will disable the active search submit button while its request is in flight. This is a UX-side guard against duplicate requests.
 
+This guard is explicit product behavior, not just a visual hint:
+
+- clicking the same search button repeatedly must not create duplicate in-flight requests
+- pressing Enter repeatedly in the same form while a request is active must also be ignored
+- the active button should switch to a loading label so the blocked state is obvious
+- the active search form may be fully disabled while its request is active if that is the simplest reliable implementation
+
 No backend queueing or deduplication changes are required in this iteration.
 
 ## Frontend Design
@@ -174,11 +181,15 @@ For image search specifically:
 While text search is running:
 
 - disable the text search button
+- ignore repeated submits from the text search form
+- show a loading state on the text search action
 - leave image search available unless shared state makes that unsafe
 
 While image search is running:
 
 - disable the image search button
+- ignore repeated submits from the image search form
+- show a loading state on the image search action
 - keep the chosen image preview visible
 
 This prevents accidental multi-submit from the same form while staying lightweight.
@@ -209,7 +220,7 @@ Add tests for:
 - image search API upload path
 - image search empty-state behavior
 - web asset coverage for the new layout and image search form
-- search button disabling during in-flight requests where current test coverage allows
+- search button disabling and duplicate-submit blocking during in-flight requests where current test coverage allows
 
 Regression coverage should ensure existing text search and preview rendering still work when image search is added.
 
