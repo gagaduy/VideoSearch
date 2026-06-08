@@ -1,5 +1,6 @@
 from math import sqrt
 from pathlib import Path
+from time import perf_counter
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -96,6 +97,17 @@ def _build_lightweight_caption(objects: list[dict[str, object]], ocr_text: str) 
     return _unique_text([*labels, ocr_text.strip().lower()])
 
 
+def _should_commit_progress(*, index: int, total: int, interval: int) -> bool:
+    step = max(interval, 1)
+    return index == total or (index % step) == 0
+
+
+def _record_stage_timing(timings: dict[str, dict[str, float | int]], stage: str, elapsed_sec: float) -> None:
+    bucket = timings.setdefault(stage, {"count": 0, "total_sec": 0.0})
+    bucket["count"] = int(bucket["count"]) + 1
+    bucket["total_sec"] = round(float(bucket["total_sec"]) + elapsed_sec, 6)
+
+
 def _should_run_vlm_enrichment(
     *,
     segment_index: int,
@@ -152,6 +164,22 @@ def _object_positions(objects: list[dict[str, object]], image_path: str) -> dict
     return {label: sorted(regions) for label, regions in positions.items()}
 
 
+def _prepare_enrich_inputs(db: Session, segments: list[Segment]) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    for segment in segments:
+        frame = db.get(Frame, int(segment.keyframe_id))
+        if frame is None:
+            continue
+        payloads.append(
+            {
+                "segment": segment,
+                "frame": frame,
+                "image_path": str(frame.image_path),
+            }
+        )
+    return payloads
+
+
 def _build_segments(frame_items: list[dict[str, object]]) -> list[list[dict[str, object]]]:
     if not frame_items:
         return []
@@ -206,43 +234,60 @@ def index_prepared_frames(
 
     frame_items: list[dict[str, object]] = []
     last_embedding: list[float] = []
+    stage_timings: dict[str, dict[str, float | int]] = {}
+    embedding_commit_interval = max(settings.embedding_commit_interval, 1)
+    openclip_batch_size = max(settings.openclip_batch_size, 1)
 
-    for index, frame_source in enumerate(frame_sources, start=1):
-        frame_path = Path(str(frame_source["image_path"]))
-        timestamp_sec = float(frame_source.get("timestamp_sec", index - 1))
-        frame_index = int(frame_source.get("frame_index", index))
-        thumb_path = Path(settings.thumbs_dir) / f"video_{video_id}" / f"{frame_path.stem}.webp"
-        copy_or_create_thumbnail(frame_path, thumb_path)
+    for batch_start in range(0, len(frame_sources), openclip_batch_size):
+        batch_sources = frame_sources[batch_start:batch_start + openclip_batch_size]
+        frame_paths = [Path(str(frame_source["image_path"])) for frame_source in batch_sources]
+        thumb_paths = []
+        for frame_path in frame_paths:
+            thumb_path = Path(settings.thumbs_dir) / f"video_{video_id}" / f"{frame_path.stem}.webp"
+            copy_or_create_thumbnail(frame_path, thumb_path)
+            thumb_paths.append(thumb_path)
 
-        embedding = openclip.embed_image(str(frame_path))
+        embed_started = perf_counter()
+        embeddings = openclip.embed_images([str(frame_path) for frame_path in frame_paths])
+        if settings.enable_stage_timing:
+            _record_stage_timing(stage_timings, "frame_embedding", perf_counter() - embed_started)
 
-        frame = Frame(
-            video_id=video_id,
-            timestamp_sec=timestamp_sec,
-            frame_index=frame_index,
-            image_path=str(frame_path),
-            thumb_path=str(thumb_path),
-            is_keyframe=True,
-        )
-        db.add(frame)
-        db.flush()
-        db.add(FrameEmbedding(frame_id=frame.id, model_name=embedding.model_name, embedding=embedding.values))
+        for batch_offset, (frame_source, frame_path, thumb_path, embedding) in enumerate(
+            zip(batch_sources, frame_paths, thumb_paths, embeddings, strict=True),
+            start=1,
+        ):
+            index = batch_start + batch_offset
+            timestamp_sec = float(frame_source.get("timestamp_sec", index - 1))
+            frame_index = int(frame_source.get("frame_index", index))
 
-        frame_items.append(
-            {
-                "frame_id": int(frame.id),
-                "timestamp_sec": float(frame.timestamp_sec),
-                "embedding_branch_a": list(embedding.values),
-                "embedding_branch_b": [],
-            }
-        )
-        last_embedding = embedding.values
-        if job_id is not None:
-            job = db.get(IndexJob, job_id)
-            if job is not None:
-                job.status = "running"
-                job.stage = f"embedding_frames:{index}/{len(frame_sources)}"
-        db.commit()
+            frame = Frame(
+                video_id=video_id,
+                timestamp_sec=timestamp_sec,
+                frame_index=frame_index,
+                image_path=str(frame_path),
+                thumb_path=str(thumb_path),
+                is_keyframe=True,
+            )
+            db.add(frame)
+            db.flush()
+            db.add(FrameEmbedding(frame_id=frame.id, model_name=embedding.model_name, embedding=embedding.values))
+
+            frame_items.append(
+                {
+                    "frame_id": int(frame.id),
+                    "timestamp_sec": float(frame.timestamp_sec),
+                    "embedding_branch_a": list(embedding.values),
+                    "embedding_branch_b": [],
+                }
+            )
+            last_embedding = embedding.values
+            if job_id is not None:
+                job = db.get(IndexJob, job_id)
+                if job is not None:
+                    job.status = "running"
+                    job.stage = f"embedding_frames:{index}/{len(frame_sources)}"
+            if _should_commit_progress(index=index, total=len(frame_sources), interval=embedding_commit_interval):
+                db.commit()
 
     _update_job_stage(db, job_id, status="running", stage="building_segments")
     segments = _persist_segments(db, video_id, frame_items)
@@ -263,6 +308,8 @@ def index_prepared_frames(
             **dict(segment.raw_json or {}),
             "dataset": source_tag,
         }
+        if settings.enable_stage_timing:
+            segment.raw_json["stage_timings"] = stage_timings
     db.commit()
 
     return {
@@ -272,6 +319,7 @@ def index_prepared_frames(
         "caption": last_caption,
         "ocr": last_ocr,
         "objects": last_objects,
+        "stage_timings": stage_timings,
     }
 
 
@@ -329,14 +377,14 @@ def _enrich_segment_keyframes(
     last_caption = ""
     last_ocr = ""
     last_objects: list[dict[str, object]] = []
-    object_prompts = build_indexing_prompts()
+    object_prompts = build_indexing_prompts(settings.yolo_prompt_profile)
+    enrich_commit_interval = max(settings.enrich_commit_interval, 1)
 
-    for index, segment in enumerate(segments, start=1):
-        frame = db.get(Frame, int(segment.keyframe_id))
-        if frame is None:
-            continue
-
-        image_path = str(frame.image_path)
+    enrich_inputs = _prepare_enrich_inputs(db, segments)
+    for index, payload in enumerate(enrich_inputs, start=1):
+        segment = payload["segment"]
+        frame = payload["frame"]
+        image_path = str(payload["image_path"])
         stage_failures: dict[str, str] = {}
 
         try:
@@ -368,6 +416,7 @@ def _enrich_segment_keyframes(
             except Exception as exc:
                 branch_b = {"caption": "", "tags": [], "entities": [], "model_name": "error"}
                 stage_failures["branch_b"] = str(exc)
+        vlm_failed = use_vlm and "branch_b" in stage_failures
 
         try:
             if branch_b.get("caption"):
@@ -376,12 +425,14 @@ def _enrich_segment_keyframes(
                     "model_name": str(branch_b.get("model_name", "internvl")),
                     "confidence": 0.9,
                 }
+            elif vlm_failed:
+                caption = {"caption": "", "model_name": "error", "confidence": 0.0}
             elif use_vlm:
                 caption = captioner.caption(image_path)
             else:
                 caption = {
                     "caption": _build_lightweight_caption(objects, str(ocr["text"])),
-                    "model_name": "balanced-heuristic",
+                    "model_name": "local-heuristic",
                     "confidence": 0.35,
                 }
         except Exception as exc:
@@ -410,6 +461,8 @@ def _enrich_segment_keyframes(
                     for alias in aliases:
                         semantic_counts[alias] = max(semantic_counts.get(alias, 0), 1)
                 semantic = {"entities": normalized_entities, "counts": semantic_counts}
+            elif vlm_failed:
+                semantic = {"entities": [], "counts": {}}
             elif use_vlm:
                 semantic = entity_extractor.extract(image_path, str(caption["caption"]), str(ocr["text"]))
             else:
@@ -501,7 +554,8 @@ def _enrich_segment_keyframes(
             if job is not None:
                 job.status = "running"
                 job.stage = f"enriching_segments:{index}/{len(segments)}"
-        db.commit()
+        if _should_commit_progress(index=index, total=len(segments), interval=enrich_commit_interval):
+            db.commit()
 
     return last_caption, last_ocr, last_objects
 

@@ -21,3 +21,10 @@ def test_web_index_contains_job_progress_panel() -> None:
     contents = Path("web/index.html").read_text(encoding="utf-8")
     assert 'id="job-status"' in contents
     assert 'id="job-progress-bar"' in contents
+
+
+def test_web_index_contains_detailed_job_progress_fields() -> None:
+    contents = Path("web/index.html").read_text(encoding="utf-8")
+    assert 'id="job-progress-percent"' in contents
+    assert 'id="job-progress-count"' in contents
+    assert 'id="job-status-note"' in contents

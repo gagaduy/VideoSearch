@@ -1,5 +1,6 @@
 from pathlib import Path
 from subprocess import run
+import hashlib
 
 from fastapi import HTTPException
 
@@ -21,11 +22,23 @@ def _preview_bounds(frame: Frame, segment: Segment | None) -> tuple[float, float
     return start_sec, end_sec
 
 
-def preview_cache_path(video_id: int, segment_id: int | None, frame_id: int) -> Path:
+def _preview_source_fingerprint(video: Video) -> str:
+    source_path = Path(video.source_path).resolve()
+    try:
+        stats = source_path.stat()
+        payload = f"{source_path}:{stats.st_size}:{stats.st_mtime_ns}"
+    except FileNotFoundError:
+        payload = str(source_path)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+
+
+def preview_cache_path(video: Video, frame: Frame) -> Path:
     ensure_data_dirs()
-    preview_dir = Path(settings.previews_dir) / f"video_{video_id}"
+    preview_dir = Path(settings.previews_dir) / f"video_{int(video.id)}"
     preview_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"segment_{segment_id}" if segment_id is not None else f"frame_{frame_id}"
+    source_fingerprint = _preview_source_fingerprint(video)
+    stem = f"segment_{frame.segment_id}" if frame.segment_id is not None else f"frame_{int(frame.id)}"
+    stem = f"{stem}_{source_fingerprint}"
     return preview_dir / f"{stem}.mp4"
 
 
@@ -34,7 +47,7 @@ def build_preview_clip(video: Video, frame: Frame, segment: Segment | None) -> P
     if not source_path.exists():
         raise HTTPException(status_code=404, detail="source video not found")
 
-    target = preview_cache_path(int(video.id), frame.segment_id, int(frame.id))
+    target = preview_cache_path(video, frame)
     if target.exists():
         return target
 

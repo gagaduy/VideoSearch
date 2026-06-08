@@ -36,6 +36,10 @@ def get_frame_media(frame_id: int, variant: str, db: Session = Depends(get_db)) 
         raise HTTPException(status_code=404, detail=f"frame {frame_id} not found")
 
     if variant == "preview":
-        return FileResponse(_build_preview_clip(frame, db), media_type="video/mp4")
+        return FileResponse(
+            _build_preview_clip(frame, db),
+            media_type="video/mp4",
+            headers={"Cache-Control": "no-store"},
+        )
 
     return FileResponse(_resolve_frame_file(frame, variant))

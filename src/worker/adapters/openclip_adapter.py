@@ -53,15 +53,29 @@ class OpenClipAdapter:
         seed = text.strip().encode("utf-8") or b" "
         return EmbeddingResult(model_name=self.model_name, values=self._fallback_values(seed))
 
-    def embed_image(self, image_path: str) -> EmbeddingResult:
+    def embed_images(self, image_paths: list[str]) -> list[EmbeddingResult]:
+        if not image_paths:
+            return []
         if self._lazy_load():
             import torch
             from PIL import Image
 
-            with Image.open(image_path) as image:
-                batch = self._preprocess(image.convert("RGB")).unsqueeze(0).to(self._device)
+            tensors = []
+            for image_path in image_paths:
+                with Image.open(image_path) as image:
+                    tensors.append(self._preprocess(image.convert("RGB")))
+            batch = torch.stack(tensors).to(self._device)
             with torch.inference_mode():
                 features = self._model.encode_image(batch)
                 features = features / features.norm(dim=-1, keepdim=True)
-            return EmbeddingResult(model_name=self.model_name, values=features[0].detach().cpu().tolist())
-        return EmbeddingResult(model_name=self.model_name, values=self._fallback_values(Path(image_path).read_bytes()))
+            return [
+                EmbeddingResult(model_name=self.model_name, values=feature.detach().cpu().tolist())
+                for feature in features
+            ]
+        return [
+            EmbeddingResult(model_name=self.model_name, values=self._fallback_values(Path(image_path).read_bytes()))
+            for image_path in image_paths
+        ]
+
+    def embed_image(self, image_path: str) -> EmbeddingResult:
+        return self.embed_images([image_path])[0]

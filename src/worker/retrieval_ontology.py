@@ -48,6 +48,17 @@ ADDITIONAL_PROMPTS = [
     "ray",
 ]
 
+COMPACT_ADDITIONAL_PROMPTS = [
+    "vehicle",
+    "bag",
+    "bottle",
+    "text",
+    "table",
+    "chair",
+    "street",
+    "building",
+]
+
 
 def _normalize_term(term: str) -> str:
     normalized = re.sub(r"\s+", " ", term.strip().lower())
@@ -66,14 +77,15 @@ def canonicalize_object_label(label: str) -> str:
     return normalized
 
 
-def build_indexing_prompts() -> list[str]:
+def build_indexing_prompts(profile: str = "full") -> list[str]:
     prompts = {
         canonical
         for canonical in CANONICAL_OBJECTS
     }
     for aliases in CANONICAL_OBJECTS.values():
         prompts.update(_normalize_term(alias) for alias in aliases if _normalize_term(alias))
-    prompts.update(_normalize_term(prompt) for prompt in ADDITIONAL_PROMPTS if _normalize_term(prompt))
+    additional_prompts = COMPACT_ADDITIONAL_PROMPTS if profile.strip().lower() == "compact" else ADDITIONAL_PROMPTS
+    prompts.update(_normalize_term(prompt) for prompt in additional_prompts if _normalize_term(prompt))
     return [*sorted(prompts), ""]
 
 

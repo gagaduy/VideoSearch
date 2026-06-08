@@ -9,5 +9,16 @@ def test_build_indexing_prompts_contains_background_and_aliases() -> None:
     assert "" in prompts
 
 
+def test_build_indexing_prompts_compact_profile_is_smaller_but_keeps_core_terms() -> None:
+    full_prompts = build_indexing_prompts()
+    compact_prompts = build_indexing_prompts("compact")
+
+    assert "person" in compact_prompts
+    assert "car" in compact_prompts
+    assert "vehicle" in compact_prompts
+    assert "" in compact_prompts
+    assert len(compact_prompts) < len(full_prompts)
+
+
 def test_normalize_query_object_terms_maps_aliases_to_canonical_terms() -> None:
     assert normalize_query_object_terms(["automobile", "ship"]) == ["car", "boat"]

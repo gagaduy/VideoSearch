@@ -4,8 +4,14 @@ from collections import defaultdict
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.db.repositories.search import create_query_log, fetch_frame_media_map
+from app.db.repositories.search import create_query_log, fetch_frame_media_map, search_segment_candidates
 from app.services.local_rerank import score_local_candidate
+from app.services.openai_vision_rerank import (
+    blend_rerank_score,
+    run_openai_vision_rerank,
+    select_rerank_candidates,
+    should_run_openai_vision_rerank,
+)
 from app.services.object_refinement import refine_object_matches
 from app.services.query_expansion import expand_query
 from app.services.query_rerank import rerank_structured_candidates
@@ -218,6 +224,139 @@ def _entity_score(row: dict[str, object], query_terms: list[str]) -> float:
     return matched / len(query_terms)
 
 
+def _compute_result_component_scores(
+    *,
+    row: dict[str, object],
+    text_terms: list[str],
+    dense_score: float,
+    text_score: float,
+    object_score: float,
+    temporal_score: float,
+) -> dict[str, float]:
+    return {
+        "dense_score": dense_score,
+        "text_score": text_score,
+        "ocr_score": _lexical_score(text_terms, str(row.get("ocr_text", ""))) if row.get("ocr_text") else 0.0,
+        "object_score": object_score,
+        "entity_score": _entity_score(row, text_terms),
+        "temporal_score": temporal_score,
+    }
+
+
+def _filter_display_results(rows: list[dict[str, object]], threshold: float, limit: int) -> list[dict[str, object]]:
+    kept = [
+        row for row in rows
+        if float(row.get("score", 0.0) or 0.0) >= threshold
+    ]
+    return kept[:limit]
+
+
+def filter_result_payloads(rows: list[dict[str, object]], threshold: float, limit: int | None = None) -> list[dict[str, object]]:
+    return _filter_display_results(
+        rows,
+        threshold=threshold,
+        limit=limit if limit is not None else settings.search_result_display_limit,
+    )
+
+
+def _embed_query_image(image_path) -> list[float]:
+    return OpenClipAdapter().embed_image(str(image_path)).values
+
+
+def _vector_similarity_score(distance: float) -> float:
+    return 1.0 / (1.0 + max(distance, 0.0))
+
+
+def build_visual_search_result(
+    *,
+    row: dict[str, object],
+    keyframe_id: int,
+    media: dict[str, str],
+    score: float,
+) -> dict[str, object]:
+    return {
+        "segment_id": int(row["segment_id"]),
+        "video_id": int(row["video_id"]),
+        "segment_index": int(row["segment_index"]),
+        "frame_id": keyframe_id,
+        "timestamp_sec": float(row["start_timestamp_sec"]),
+        "start_timestamp_sec": float(row["start_timestamp_sec"]),
+        "end_timestamp_sec": float(row["end_timestamp_sec"]),
+        "score": score,
+        "object_labels": _row_display_labels(row),
+        "object_counts": _row_display_counts(row),
+        "object_positions": {key: sorted(value) for key, value in _row_semantic_positions(row).items()},
+        "caption": str(row.get("caption_text", "")),
+        "thumb_url": f"/media/frames/{keyframe_id}/thumb" if media else "",
+        "image_url": f"/media/frames/{keyframe_id}/image" if media else "",
+        "preview_url": f"/media/frames/{keyframe_id}/preview" if media else "",
+        "_image_path": str(media.get("image_path", "")) if media else "",
+    }
+
+
+def _apply_openai_vision_rerank(query: str, results: list[dict[str, object]]) -> list[dict[str, object]]:
+    if not should_run_openai_vision_rerank(
+        enabled=settings.openai_vision_rerank_enabled,
+        api_key=settings.openai_api_key,
+        candidates=results,
+    ):
+        return results
+
+    top_candidates = select_rerank_candidates(results, settings.openai_vision_rerank_top_k)
+    vision_scores = run_openai_vision_rerank(query, top_candidates)
+    updated: list[dict[str, object]] = []
+    for index, row in enumerate(results):
+        frame_id = int(row.get("frame_id") or -1)
+        if index < settings.openai_vision_rerank_top_k and frame_id in vision_scores:
+            local_score = float(row.get("score", 0.0) or 0.0)
+            row = {
+                **row,
+                "score": blend_rerank_score(
+                    local_score=local_score,
+                    vision_score=float(vision_scores[frame_id]),
+                    local_weight=settings.openai_vision_rerank_local_weight,
+                    vision_weight=settings.openai_vision_rerank_vision_weight,
+                ),
+            }
+        updated.append(row)
+    return sorted(updated, key=lambda item: float(item.get("score", 0.0)), reverse=True)
+
+
+def run_image_search(db: Session, image_path) -> dict[str, object]:
+    query_embedding = _embed_query_image(image_path)
+    rows = search_segment_candidates(db, query_embedding, limit=80)
+    frame_media = fetch_frame_media_map(
+        db,
+        [int(row["keyframe_id"]) for row in rows if row["keyframe_id"] is not None],
+    )
+
+    results: list[dict[str, object]] = []
+    for row in rows:
+        keyframe_id = int(row["keyframe_id"]) if row["keyframe_id"] is not None else None
+        if keyframe_id is None:
+            continue
+        media = frame_media.get(keyframe_id, {})
+        results.append(
+            build_visual_search_result(
+                row=row,
+                keyframe_id=keyframe_id,
+                media=media,
+                score=_vector_similarity_score(float(row.get("vector_distance", 0.0) or 0.0)),
+            )
+        )
+
+    results = filter_result_payloads(results, threshold=settings.image_result_score_threshold)
+    results = [{key: value for key, value in item.items() if key != "_image_path"} for item in results]
+
+    return {
+        "mode": "image",
+        "query": getattr(image_path, "name", "query-image"),
+        "expanded_queries": [],
+        "results": results,
+        "parsed_query": None,
+    }
+
+
 def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, object]:
     structured = parse_structured_query(query, api_key=settings.openai_api_key, model=settings.openai_model)
     object_filters = _merge_object_filters(structured, object_labels)
@@ -324,6 +463,7 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
                 "thumb_url": f"/media/frames/{keyframe_id}/thumb" if keyframe_id is not None and media else "",
                 "image_url": f"/media/frames/{keyframe_id}/image" if keyframe_id is not None and media else "",
                 "preview_url": f"/media/frames/{keyframe_id}/preview" if keyframe_id is not None and media else "",
+                "_image_path": str(media.get("image_path", "")) if keyframe_id is not None and media else "",
                 "diagnostics": {
                     **diagnostics.get(segment_id, {}),
                     "object_refinement_score": refinement_scores.get(keyframe_id or -1, 0.0),
@@ -336,17 +476,20 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
     text_terms = _tokenize(" ".join(expanded))
     for item in ranked_segments:
         segment_id = int(item["segment_id"])
-        base = {
-            **item,
-            "dense_score": fused_scores.get(segment_id, 0.0),
-            "text_score": diagnostics.get(segment_id, {}).get("text_score", 0.0),
-            "ocr_score": _lexical_score(text_terms, str(item["caption"])) if item["caption"] else 0.0,
-            "object_score": max(
+        component_scores = _compute_result_component_scores(
+            row=rows_by_segment[segment_id],
+            text_terms=text_terms,
+            dense_score=fused_scores.get(segment_id, 0.0),
+            text_score=diagnostics.get(segment_id, {}).get("text_score", 0.0),
+            object_score=max(
                 diagnostics.get(segment_id, {}).get("object_score", 0.0),
                 refinement_scores.get(int(item.get("frame_id") or -1), 0.0),
             ),
-            "entity_score": _entity_score(rows_by_segment[segment_id], text_terms),
-            "temporal_score": temporal_bonus.get(segment_id, 0.0),
+            temporal_score=temporal_bonus.get(segment_id, 0.0),
+        )
+        base = {
+            **item,
+            **component_scores,
             "hard_constraints_passed": passes_filters.get(segment_id, True) if enforce_hard_filter else True,
         }
         item["score"] = apply_constraint_penalty(
@@ -356,6 +499,13 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
 
     ranked_segments = sorted(ranked_segments, key=lambda row: float(row["score"]), reverse=True)
     results = [item for item in ranked_segments if item.get("frame_id")]
+    results = _filter_display_results(
+        results,
+        threshold=settings.text_result_score_threshold,
+        limit=settings.search_result_display_limit,
+    )
+    results = _apply_openai_vision_rerank(query, results)
+    results = [{key: value for key, value in item.items() if key != "_image_path"} for item in results]
     create_query_log(db, query, expanded, object_labels, results)
     db.commit()
     return {

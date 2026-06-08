@@ -1,15 +1,29 @@
-const apiBase = window.VIDEO_API_BASE || "http://localhost:8001";
+const defaultApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
+const apiBase = window.VIDEO_API_BASE || defaultApiBase;
 const uploadForm = document.getElementById("upload-form");
 const videoFileInput = document.getElementById("video-file");
 const videoFilenameInput = document.getElementById("video-filename");
 const searchForm = document.getElementById("search-form");
+const questionSearchForm = document.getElementById("question-search-form");
+const questionQueryInput = document.getElementById("question-query");
+const videoQueryForm = document.getElementById("video-query-form");
+const queryVideoInput = document.getElementById("query-video");
+const queryVideoPreview = document.getElementById("query-video-preview");
 const jobStatus = document.getElementById("job-status");
 const jobStatusLabel = document.getElementById("job-status-label");
 const jobStageLabel = document.getElementById("job-stage-label");
+const jobProgressCount = document.getElementById("job-progress-count");
+const jobProgressPercent = document.getElementById("job-progress-percent");
 const jobProgressBar = document.getElementById("job-progress-bar");
+const jobStatusNote = document.getElementById("job-status-note");
 const jobOutput = document.getElementById("job-output");
 const results = document.getElementById("results");
 const timelinePreview = document.getElementById("timeline-preview");
+const jobStatusPanel = document.getElementById("job-status-panel");
+let textSearchInFlight = false;
+let questionSearchInFlight = false;
+let videoQueryInFlight = false;
+let activeQueryVideoUrl = "";
 
 function splitLabels(value) {
   return value
@@ -101,6 +115,70 @@ function progressForJob(job) {
   return 20;
 }
 
+function parseJobProgress(job) {
+  const stage = String(job?.stage || "queued");
+  const quantifiedStage = stage.match(/^(embedding_frames|enriching_segments|indexing):(\d+)\/(\d+)$/);
+  const percent = progressForJob(job);
+  if (!quantifiedStage) {
+    return {
+      stage,
+      current: null,
+      total: null,
+      percent,
+    };
+  }
+  return {
+    stage: quantifiedStage[1],
+    current: Number.parseInt(quantifiedStage[2], 10),
+    total: Number.parseInt(quantifiedStage[3], 10),
+    percent,
+  };
+}
+
+function describeJobNote(job) {
+  const stage = String(job?.stage || "queued");
+  if (job?.status === "completed" || stage === "done") {
+    return "Indexing finished. Search is ready to use.";
+  }
+  if (job?.status === "failed" || stage === "error") {
+    return "Indexing failed. Check the latest job state and worker logs.";
+  }
+  if (stage === "queued") {
+    return "Job is queued and waiting for the worker.";
+  }
+  if (stage === "processing") {
+    return "Upload completed. Worker is preparing the indexing job.";
+  }
+  if (stage === "extracting_frames") {
+    return "Worker is extracting candidate frames from the uploaded video.";
+  }
+  if (stage.startsWith("embedding_frames:")) {
+    return "Worker is embedding extracted frames for segment building.";
+  }
+  if (stage === "building_segments") {
+    return "Worker is grouping nearby frames into retrieval segments.";
+  }
+  if (stage.startsWith("enriching_segments:")) {
+    return "Worker is enriching segment keyframes with InternVL, OCR, and object detection.";
+  }
+  return "Worker is updating the indexing job.";
+}
+
+function formatProgressCount(progress) {
+  if (!Number.isFinite(progress.current) || !Number.isFinite(progress.total)) {
+    return "stage-based";
+  }
+  return `${progress.current}/${progress.total}`;
+}
+
+function formatRetrievalScore(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "n/a";
+  }
+  return numeric.toFixed(3);
+}
+
 function formatTimestamp(value) {
   const seconds = Math.max(0, Math.floor(Number(value) || 0));
   const minutes = Math.floor(seconds / 60);
@@ -121,14 +199,47 @@ function formatObjectCounts(counts) {
   return entries.map(([label, count]) => `${label}×${count}`).join(", ");
 }
 
-function renderJobStatus(job, message) {
-  if (!jobStatus || !jobStatusLabel || !jobStageLabel || !jobProgressBar) {
+function revokeActiveQueryVideoUrl() {
+  if (activeQueryVideoUrl) {
+    URL.revokeObjectURL(activeQueryVideoUrl);
+    activeQueryVideoUrl = "";
+  }
+}
+
+function renderEmptyState(message) {
+  results.className = "results-pane";
+  results.innerHTML = `<p class="empty-state">${message}</p>`;
+  timelinePreview.textContent = "No result selected.";
+}
+
+function renderSearchResults(payload, emptyMessage) {
+  renderResults(payload.results || [], emptyMessage);
+}
+
+function syncIdleJobStatus() {
+  if (!jobStatusPanel || !jobStatus) {
     return;
   }
+  if (jobStatus.hidden) {
+    jobStatusPanel.classList.add("panel-idle");
+  } else {
+    jobStatusPanel.classList.remove("panel-idle");
+  }
+}
+
+function renderJobStatus(job, message) {
+  if (!jobStatus || !jobStatusLabel || !jobStageLabel || !jobProgressBar || !jobProgressCount || !jobProgressPercent || !jobStatusNote) {
+    return;
+  }
+  const progress = parseJobProgress(job);
   jobStatus.hidden = false;
   jobStatusLabel.textContent = message;
   jobStageLabel.textContent = formatStage(job?.stage);
-  jobProgressBar.style.width = `${progressForJob(job)}%`;
+  jobProgressCount.textContent = formatProgressCount(progress);
+  jobProgressPercent.textContent = `${progress.percent}%`;
+  jobProgressBar.style.width = `${progress.percent}%`;
+  jobStatusNote.textContent = describeJobNote(job);
+  syncIdleJobStatus();
 }
 
 async function pollJob(jobId) {
@@ -142,8 +253,14 @@ async function pollJob(jobId) {
     await new Promise((resolve) => window.setTimeout(resolve, 1000));
   }
 
+  renderJobStatus({ status: "running", stage: "processing" }, "Polling timed out");
+  if (jobStatusNote) {
+    jobStatusNote.textContent = "Polling timed out while the worker may still be running. Refresh the page or query the job again.";
+  }
   return null;
 }
+
+syncIdleJobStatus();
 
 if (videoFileInput && videoFilenameInput) {
   videoFileInput.addEventListener("change", () => {
@@ -192,10 +309,10 @@ if (uploadForm) {
       const finalJob = await pollJob(data.job.id);
       if (finalJob) {
         jobOutput.textContent = JSON.stringify(
-          {
-            ...data,
-            job: finalJob,
-            message: finalJob.status === "completed" ? "Indexing completed." : "Indexing failed.",
+        {
+          ...data,
+          job: finalJob,
+          message: finalJob.status === "completed" ? "Indexing completed." : "Indexing failed.",
           },
           null,
           2,
@@ -218,11 +335,20 @@ if (uploadForm) {
 if (searchForm) {
   searchForm.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (textSearchInFlight) {
+      return;
+    }
     const formData = new FormData(searchForm);
     const payload = {
       query: formData.get("query"),
       object_labels: splitLabels(String(formData.get("object_labels") || "")),
     };
+    const submitButton = searchForm.querySelector("button[type='submit']");
+    textSearchInFlight = true;
+    if (submitButton instanceof HTMLButtonElement) {
+      submitButton.disabled = true;
+      submitButton.textContent = "Searching...";
+    }
 
     try {
       const response = await fetch(`${apiBase}/search`, {
@@ -235,19 +361,130 @@ if (searchForm) {
       if (!response.ok) {
         throw new Error(data.detail || "Search failed.");
       }
-      renderResults(data.results || []);
+      renderSearchResults(data, "No strong matches found for this query.");
     } catch (error) {
       results.textContent = error instanceof Error ? error.message : "Search failed.";
       timelinePreview.textContent = "No result selected.";
+    } finally {
+      textSearchInFlight = false;
+      if (submitButton instanceof HTMLButtonElement) {
+        submitButton.disabled = false;
+        submitButton.textContent = "Search";
+      }
     }
   });
 }
 
-function renderResults(items) {
+if (questionSearchForm) {
+  questionSearchForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (questionSearchInFlight) {
+      return;
+    }
+
+    const question = String(questionQueryInput?.value || "").trim();
+    if (!question) {
+      renderEmptyState("Enter a question before searching for evidence frames.");
+      return;
+    }
+
+    const submitButton = questionSearchForm.querySelector("button[type='submit']");
+    questionSearchInFlight = true;
+    if (submitButton instanceof HTMLButtonElement) {
+      submitButton.disabled = true;
+      submitButton.textContent = "Searching...";
+    }
+
+    try {
+      const response = await fetch(`${apiBase}/search/question`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Question search failed.");
+      }
+      renderSearchResults(data, "No strong evidence frames found for this question.");
+    } catch (error) {
+      results.textContent = error instanceof Error ? error.message : "Question search failed.";
+      timelinePreview.textContent = "No result selected.";
+    } finally {
+      questionSearchInFlight = false;
+      if (submitButton instanceof HTMLButtonElement) {
+        submitButton.disabled = false;
+        submitButton.textContent = "Find Evidence Frames";
+      }
+    }
+  });
+}
+
+if (queryVideoInput && queryVideoPreview) {
+  queryVideoInput.addEventListener("change", () => {
+    const [file] = queryVideoInput.files || [];
+    revokeActiveQueryVideoUrl();
+    if (!file) {
+      queryVideoPreview.textContent = "No query clip selected.";
+      return;
+    }
+    activeQueryVideoUrl = URL.createObjectURL(file);
+    queryVideoPreview.innerHTML = `
+      <video class="preview-video" controls muted playsinline preload="metadata">
+        <source src="${activeQueryVideoUrl}" type="${file.type || "video/mp4"}">
+      </video>
+    `;
+  });
+}
+
+if (videoQueryForm) {
+  videoQueryForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (videoQueryInFlight) {
+      return;
+    }
+
+    const formData = new FormData(videoQueryForm);
+    const file = formData.get("file");
+    if (!(file instanceof File) || !file.size) {
+      renderEmptyState("Choose a short video clip before searching.");
+      return;
+    }
+
+    const submitButton = videoQueryForm.querySelector("button[type='submit']");
+    videoQueryInFlight = true;
+    if (submitButton instanceof HTMLButtonElement) {
+      submitButton.disabled = true;
+      submitButton.textContent = "Searching...";
+    }
+
+    try {
+      const response = await fetch(`${apiBase}/search/video-query`, {
+        method: "POST",
+        body: formData,
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Video clip search failed.");
+      }
+      renderSearchResults(data, "No strong matches found for this clip.");
+    } catch (error) {
+      results.textContent = error instanceof Error ? error.message : "Video clip search failed.";
+      timelinePreview.textContent = "No result selected.";
+    } finally {
+      videoQueryInFlight = false;
+      if (submitButton instanceof HTMLButtonElement) {
+        submitButton.disabled = false;
+        submitButton.textContent = "Find Similar Frames";
+      }
+    }
+  });
+}
+
+function renderResults(items, emptyMessage = "No strong matches found for this query.") {
   results.innerHTML = "";
   if (!items.length) {
-    results.textContent = "No results.";
-    timelinePreview.textContent = "No result selected.";
+    renderEmptyState(emptyMessage);
     return;
   }
 
@@ -260,7 +497,7 @@ function renderResults(items) {
       <div class="result-body">
         <strong>Frame #${item.frame_id}</strong>
         <p>${item.caption || "No caption"}</p>
-        <small>${formatTimestamp(item.start_timestamp_sec)}-${formatTimestamp(item.end_timestamp_sec)} | score=${item.score.toFixed(4)}</small>
+        <small>${formatTimestamp(item.start_timestamp_sec)}-${formatTimestamp(item.end_timestamp_sec)} | relative match=${formatRetrievalScore(item.score)}</small>
         ${formatObjectCounts(item.object_counts) ? `<div class="object-counts">${formatObjectCounts(item.object_counts)}</div>` : ""}
       </div>
     `;

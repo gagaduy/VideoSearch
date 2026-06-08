@@ -7,45 +7,90 @@
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
-    <main class="shell">
-      <header class="hero">
-        <p class="eyebrow">Multimodal Retrieval</p>
-        <h1>Video Retrieval</h1>
-        <p class="summary">Upload videos, index keyframes, expand queries, and inspect timeline-aware search results.</p>
-      </header>
+    <main class="workspace">
+      <aside class="left-rail compact-sidebar">
+        <header class="hero panel hero-compact">
+          <p class="eyebrow">Multimodal Retrieval</p>
+          <h1>Video Retrieval</h1>
+        </header>
 
-      <section class="panel">
-        <h2>Ingest</h2>
-        <form id="upload-form" class="stack">
-          <input id="video-file" name="file" type="file" accept="video/*" required>
-          <input id="video-filename" name="filename" placeholder="Selected file" readonly>
-          <button type="submit">Create Index Job</button>
-        </form>
-        <section id="job-status" class="job-status" hidden>
-          <div class="job-status-row">
-            <strong id="job-status-label">Waiting</strong>
-            <span id="job-stage-label">queued</span>
-          </div>
-          <div class="progress-track" aria-hidden="true">
-            <div id="job-progress-bar" class="progress-bar"></div>
-          </div>
+        <section class="panel">
+          <h2>Import Video</h2>
+          <form id="upload-form" class="stack">
+            <input id="video-file" name="file" type="file" accept="video/*" required>
+            <input id="video-filename" name="filename" placeholder="Selected file" readonly>
+            <button type="submit">Create Index Job</button>
+          </form>
         </section>
-        <pre id="job-output"></pre>
-      </section>
 
-      <section class="panel">
-        <h2>Search</h2>
-        <form id="search-form" class="stack">
-          <input id="query" name="query" placeholder="man fixing car">
-          <input id="object-labels" name="object_labels" placeholder="car,person">
-          <button type="submit">Search</button>
-        </form>
-        <section id="results"></section>
-      </section>
+        <section class="panel panel-idle" id="job-status-panel">
+          <h2>Job Progress</h2>
+          <section id="job-status" class="job-status" hidden>
+            <div class="job-status-row">
+              <strong id="job-status-label">Waiting</strong>
+              <span id="job-stage-label">queued</span>
+            </div>
+            <div class="job-progress-meta">
+              <span id="job-progress-count">0/0</span>
+              <span id="job-progress-percent">0%</span>
+            </div>
+            <div class="progress-track" aria-hidden="true">
+              <div id="job-progress-bar" class="progress-bar"></div>
+            </div>
+            <p id="job-status-note" class="job-status-note">Waiting for a job.</p>
+          </section>
+          <pre id="job-output"></pre>
+        </section>
 
-      <section class="panel">
-        <h2>Timeline Preview</h2>
-        <section id="timeline-preview">No result selected.</section>
+        <section class="panel">
+          <h2>Search By Text</h2>
+          <form id="search-form" class="stack">
+            <input id="query" name="query" placeholder="man fixing car">
+            <input id="object-labels" name="object_labels" placeholder="car,person">
+            <button type="submit">Search</button>
+          </form>
+        </section>
+
+        <section class="panel">
+          <h2>Search By Question</h2>
+          <form id="question-search-form" class="stack">
+            <textarea id="question-query" name="question" rows="4" placeholder="What is the name of the virus shown in this video?"></textarea>
+            <button type="submit">Find Evidence Frames</button>
+          </form>
+          <p class="muted">Find frames that are most likely to contain information needed to answer the question.</p>
+        </section>
+
+        <section class="panel">
+          <h2>Search By Video Clip</h2>
+          <form id="video-query-form" class="stack">
+            <input id="query-video" name="file" type="file" accept="video/*" required>
+            <button type="submit">Find Similar Frames</button>
+          </form>
+          <p class="muted">Use a short clip under 10 seconds.</p>
+          <section id="query-video-preview" class="query-media-preview-slot query-media-preview-compact">No query clip selected.</section>
+        </section>
+      </aside>
+
+      <section class="workspace-main split-workspace">
+        <section class="workspace-results panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Results</p>
+              <h2>Frames</h2>
+            </div>
+          </div>
+          <section id="results" class="results-pane"></section>
+        </section>
+
+        <section class="workspace-preview panel">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Preview</p>
+              <h2>Timeline Preview</h2>
+            </div>
+          </div>
+          <section id="timeline-preview" class="preview-pane">No result selected.</section>
+        </section>
       </section>
     </main>
     <script src="app.js"></script>
