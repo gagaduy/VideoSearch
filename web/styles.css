@@ -122,6 +122,20 @@ body {
   color: rgba(29, 43, 34, 0.72);
 }
 
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  font-size: 0.95rem;
+  color: #2d3429;
+}
+
+.toggle-row input[type="checkbox"] {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+}
+
 input,
 textarea,
 button {

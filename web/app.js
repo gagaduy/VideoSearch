@@ -4,6 +4,7 @@ const uploadForm = document.getElementById("upload-form");
 const videoFileInput = document.getElementById("video-file");
 const videoFilenameInput = document.getElementById("video-filename");
 const searchForm = document.getElementById("search-form");
+const openaiRerankToggle = document.getElementById("openai-rerank-toggle");
 const questionSearchForm = document.getElementById("question-search-form");
 const questionQueryInput = document.getElementById("question-query");
 const videoQueryForm = document.getElementById("video-query-form");
@@ -24,6 +25,10 @@ let textSearchInFlight = false;
 let questionSearchInFlight = false;
 let videoQueryInFlight = false;
 let activeQueryVideoUrl = "";
+
+function useOpenAiEnhancements() {
+  return openaiRerankToggle instanceof HTMLInputElement ? openaiRerankToggle.checked : true;
+}
 
 function splitLabels(value) {
   return value
@@ -342,6 +347,7 @@ if (searchForm) {
     const payload = {
       query: formData.get("query"),
       object_labels: splitLabels(String(formData.get("object_labels") || "")),
+      use_openai_rerank: useOpenAiEnhancements(),
     };
     const submitButton = searchForm.querySelector("button[type='submit']");
     textSearchInFlight = true;
@@ -399,7 +405,10 @@ if (questionSearchForm) {
       const response = await fetch(`${apiBase}/search/question`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({
+          question,
+          use_openai_rerank: useOpenAiEnhancements(),
+        }),
       });
 
       const data = await response.json();
@@ -453,6 +462,7 @@ if (videoQueryForm) {
 
     const submitButton = videoQueryForm.querySelector("button[type='submit']");
     videoQueryInFlight = true;
+    formData.append("use_openai_rerank", String(useOpenAiEnhancements()));
     if (submitButton instanceof HTMLButtonElement) {
       submitButton.disabled = true;
       submitButton.textContent = "Searching...";

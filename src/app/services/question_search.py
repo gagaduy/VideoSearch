@@ -90,7 +90,12 @@ def _load_segment_rows(db: Session) -> list[dict[str, object]]:
     ]
 
 
-def run_question_search(db: Session, question: str) -> dict[str, object]:
+def run_question_search(
+    db: Session,
+    question: str,
+    *,
+    use_openai_rerank: bool | None = None,
+) -> dict[str, object]:
     query = question.strip()
     if not query:
         return {
@@ -126,7 +131,7 @@ def run_question_search(db: Session, question: str) -> dict[str, object]:
         )
 
     if should_run_openai_vision_rerank(
-        enabled=settings.openai_vision_rerank_enabled,
+        enabled=(settings.openai_enabled and settings.openai_vision_rerank_enabled) if use_openai_rerank is None else (settings.openai_enabled and use_openai_rerank),
         api_key=settings.openai_api_key,
         candidates=results,
     ):

@@ -526,6 +526,9 @@ def test_run_index_pipeline_returns_stage_timings(monkeypatch, tmp_path: Path) -
         segment = session.query(Segment).filter(Segment.video_id == video.id).one()
         assert "stage_timings" in payload
         assert "frame_embedding" in payload["stage_timings"]
+        assert "ocr" in payload["stage_timings"]
+        assert "detector" in payload["stage_timings"]
+        assert "branch_b" in payload["stage_timings"]
         assert "stage_timings" in segment.raw_json
     finally:
         session.close()

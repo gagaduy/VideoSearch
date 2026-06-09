@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     frames_dir: Path = Field(default=Path("./data/frames"))
     thumbs_dir: Path = Field(default=Path("./data/thumbs"))
     previews_dir: Path = Field(default=Path("./data/previews"))
+    openai_enabled: bool = True
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
     indexing_profile: str = "full"

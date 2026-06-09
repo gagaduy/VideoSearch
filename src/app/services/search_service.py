@@ -1,5 +1,6 @@
 import re
 from collections import defaultdict
+from time import perf_counter
 
 from sqlalchemy.orm import Session
 
@@ -21,9 +22,37 @@ from app.services.retrieval_fusion import apply_constraint_penalty, fuse_branch_
 from app.services.temporal_paths import find_best_temporal_paths
 from worker.adapters.openclip_adapter import OpenClipAdapter
 
+_SEARCH_DENSE_ENCODER: OpenClipAdapter | None = None
+
 
 def _tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _get_search_dense_encoder() -> OpenClipAdapter:
+    global _SEARCH_DENSE_ENCODER
+    if _SEARCH_DENSE_ENCODER is None:
+        _SEARCH_DENSE_ENCODER = OpenClipAdapter()
+    return _SEARCH_DENSE_ENCODER
+
+
+def _current_rss_mb() -> float:
+    try:
+        for line in open("/proc/self/status", "r", encoding="utf-8"):
+            if line.startswith("VmRSS:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return round(float(parts[1]) / 1024.0, 1)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+def _record_search_stage(metrics: dict[str, object], stage: str, started_at: float) -> None:
+    metrics.setdefault("stage_timings", {})[stage] = {
+        "elapsed_sec": round(perf_counter() - started_at, 6),
+        "rss_mb": _current_rss_mb(),
+    }
 
 
 def _lexical_score(query_terms: list[str], text: str) -> float:
@@ -294,9 +323,14 @@ def build_visual_search_result(
     }
 
 
-def _apply_openai_vision_rerank(query: str, results: list[dict[str, object]]) -> list[dict[str, object]]:
+def _apply_openai_vision_rerank(
+    query: str,
+    results: list[dict[str, object]],
+    *,
+    use_openai_rerank: bool | None = None,
+) -> list[dict[str, object]]:
     if not should_run_openai_vision_rerank(
-        enabled=settings.openai_vision_rerank_enabled,
+        enabled=(settings.openai_enabled and settings.openai_vision_rerank_enabled) if use_openai_rerank is None else (settings.openai_enabled and use_openai_rerank),
         api_key=settings.openai_api_key,
         candidates=results,
     ):
@@ -357,27 +391,65 @@ def run_image_search(db: Session, image_path) -> dict[str, object]:
     }
 
 
-def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, object]:
-    structured = parse_structured_query(query, api_key=settings.openai_api_key, model=settings.openai_model)
+def run_search(
+    db: Session,
+    query: str,
+    object_labels: list[str],
+    *,
+    use_openai_rerank: bool | None = None,
+) -> dict[str, object]:
+    total_started = perf_counter()
+    debug_metrics: dict[str, object] = {
+        "rss_mb": _current_rss_mb(),
+        "openai_enabled": bool(settings.openai_enabled),
+        "openai_requested": bool(use_openai_rerank) if use_openai_rerank is not None else True,
+        "stage_timings": {},
+    }
+    use_openai_features = (
+        settings.openai_api_key
+        if settings.openai_enabled and (use_openai_rerank is None or use_openai_rerank)
+        else ""
+    )
+    parse_started = perf_counter()
+    structured = parse_structured_query(query, api_key=use_openai_features, model=settings.openai_model)
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "structured_query", parse_started)
     object_filters = _merge_object_filters(structured, object_labels)
     expanded = structured.semantic_queries or [structured.semantic_query]
-    if settings.openai_api_key:
-        for item in expand_query(structured.semantic_query, api_key=settings.openai_api_key, model=settings.openai_model):
+    expand_started = perf_counter()
+    if use_openai_features:
+        for item in expand_query(structured.semantic_query, api_key=use_openai_features, model=settings.openai_model):
             if item not in expanded:
                 expanded.append(item)
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "query_expansion", expand_started)
 
+    collect_started = perf_counter()
     branch_rows = collect_branch_candidates(
         db,
         semantic_query=structured.semantic_query,
         expanded_queries=expanded,
         object_filters=object_filters,
         temporal_steps=structured.temporal_steps,
-        dense_encoder=OpenClipAdapter(),
+        dense_encoder=_get_search_dense_encoder(),
     )
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "collect_branch_candidates", collect_started)
     if not any(branch_rows.values()):
+        commit_started = perf_counter()
         create_query_log(db, query, expanded, object_labels, [])
         db.commit()
-        return {"query": query, "expanded_queries": expanded, "results": [], "parsed_query": structured.model_dump()}
+        if settings.enable_stage_timing:
+            _record_search_stage(debug_metrics, "query_log_commit", commit_started)
+            _record_search_stage(debug_metrics, "total", total_started)
+            debug_metrics["rss_mb"] = _current_rss_mb()
+        return {
+            "query": query,
+            "expanded_queries": expanded,
+            "results": [],
+            "parsed_query": structured.model_dump(),
+            "debug_metrics": debug_metrics,
+        }
 
     rows_by_segment: dict[int, dict[str, object]] = {}
     branch_rankings: dict[str, list[int]] = {}
@@ -391,18 +463,25 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
                     existing[key] = value
     rows = list(rows_by_segment.values())
 
+    rankings_started = perf_counter()
     rankings, diagnostics, passes_filters = _candidate_rankings(rows, expanded, object_filters)
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "candidate_rankings", rankings_started)
     for branch_name, ranking in branch_rankings.items():
         if ranking:
             rankings[branch_name] = ranking
     fused_scores = fuse_branch_rankings(rankings)
     temporal_bonus = _temporal_path_scores(rows, structured.temporal_steps)
+    media_started = perf_counter()
     frame_media = fetch_frame_media_map(
         db,
         [int(row["keyframe_id"]) for row in rows if row["keyframe_id"] is not None],
     )
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "fetch_frame_media", media_started)
     refinement_scores: dict[int, float] = {}
     query_object_terms = [item.label for item in object_filters]
+    refinement_started = perf_counter()
     if query_object_terms:
         candidate_frames = []
         for row in sorted(rows, key=lambda item: fused_scores.get(int(item["segment_id"]), 0.0), reverse=True)[:12]:
@@ -412,6 +491,8 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
             if keyframe_id is not None and image_path:
                 candidate_frames.append({"frame_id": keyframe_id, "image_path": image_path})
         refinement_scores = refine_object_matches(candidate_frames, query_object_terms)
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "object_refinement", refinement_started)
 
     filtered_segment_ids = {segment_id for segment_id, passed in passes_filters.items() if passed}
     enforce_hard_filter = bool(object_filters and filtered_segment_ids)
@@ -430,12 +511,15 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
         }
         for row in rows[:25]
     ]
+    llm_alignment_started = perf_counter()
     llm_alignment_scores = rerank_structured_candidates(
         structured,
         rerank_payload,
-        api_key=settings.openai_api_key,
+        api_key=use_openai_features,
         model=settings.openai_model,
     )
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "llm_alignment", llm_alignment_started)
 
     ranked_segments: list[dict[str, object]] = []
     for row in rows:
@@ -473,6 +557,7 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
             }
         )
 
+    local_scoring_started = perf_counter()
     text_terms = _tokenize(" ".join(expanded))
     for item in ranked_segments:
         segment_id = int(item["segment_id"])
@@ -496,21 +581,35 @@ def run_search(db: Session, query: str, object_labels: list[str]) -> dict[str, o
             base,
             score_local_candidate(base) + (0.12 * llm_alignment_scores.get(segment_id, 0.0)),
         )
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "local_scoring", local_scoring_started)
 
     ranked_segments = sorted(ranked_segments, key=lambda row: float(row["score"]), reverse=True)
     results = [item for item in ranked_segments if item.get("frame_id")]
+    display_started = perf_counter()
     results = _filter_display_results(
         results,
         threshold=settings.text_result_score_threshold,
         limit=settings.search_result_display_limit,
     )
-    results = _apply_openai_vision_rerank(query, results)
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "display_filter", display_started)
+    vision_started = perf_counter()
+    results = _apply_openai_vision_rerank(query, results, use_openai_rerank=use_openai_rerank)
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "vision_rerank", vision_started)
     results = [{key: value for key, value in item.items() if key != "_image_path"} for item in results]
+    commit_started = perf_counter()
     create_query_log(db, query, expanded, object_labels, results)
     db.commit()
+    if settings.enable_stage_timing:
+        _record_search_stage(debug_metrics, "query_log_commit", commit_started)
+        _record_search_stage(debug_metrics, "total", total_started)
+        debug_metrics["rss_mb"] = _current_rss_mb()
     return {
         "query": query,
         "expanded_queries": expanded,
         "results": results,
         "parsed_query": structured.model_dump(),
+        "debug_metrics": debug_metrics,
     }

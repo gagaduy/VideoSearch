@@ -14,6 +14,7 @@ from worker import pipeline
 
 
 def _reset_search_api_state() -> None:
+    search_service._SEARCH_DENSE_ENCODER = None
     session_factory = get_session_factory()
     session = session_factory()
     try:
@@ -233,7 +234,7 @@ def test_video_query_search_returns_results(monkeypatch, tmp_path: Path) -> None
 
     monkeypatch.setattr(
         "app.api.routes.search.run_video_query_search",
-        lambda db, upload: {
+        lambda db, upload, **_kwargs: {
             "mode": "video",
             "query": "query.mp4",
             "expanded_queries": [],
@@ -271,7 +272,7 @@ def test_question_search_returns_results(monkeypatch) -> None:
 
     monkeypatch.setattr(
         "app.api.routes.search.run_question_search",
-        lambda db, question: {
+        lambda db, question, **_kwargs: {
             "mode": "question",
             "query": question,
             "expanded_queries": [],

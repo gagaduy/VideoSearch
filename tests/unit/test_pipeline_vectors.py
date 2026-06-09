@@ -140,3 +140,74 @@ def test_prepare_enrich_inputs_preserves_segment_order(tmp_path) -> None:
     payloads = pipeline._prepare_enrich_inputs(_Db(), [first, second])
 
     assert [payload["segment"] for payload in payloads] == [first, second]
+
+
+def test_prepare_enrich_inputs_uses_bulk_frame_lookup_when_available(tmp_path) -> None:
+    class _Frame:
+        def __init__(self, frame_id: int, image_path: str) -> None:
+            self.id = frame_id
+            self.image_path = image_path
+
+    class _ScalarResult:
+        def __init__(self, frames) -> None:
+            self._frames = frames
+
+        def all(self):
+            return self._frames
+
+    class _Result:
+        def __init__(self, frames) -> None:
+            self._frames = frames
+
+        def scalars(self):
+            return _ScalarResult(self._frames)
+
+    class _Db:
+        def execute(self, _statement):
+            return _Result(
+                [
+                    _Frame(3, str(tmp_path / "3.png")),
+                    _Frame(9, str(tmp_path / "9.png")),
+                ]
+            )
+
+        def get(self, model, keyframe_id):
+            raise AssertionError("bulk frame lookup should avoid db.get in the hot path")
+
+    class _Segment:
+        def __init__(self, keyframe_id: int) -> None:
+            self.keyframe_id = keyframe_id
+
+    payloads = pipeline._prepare_enrich_inputs(_Db(), [_Segment(3), _Segment(9)])
+
+    assert [payload["image_path"] for payload in payloads] == [
+        str(tmp_path / "3.png"),
+        str(tmp_path / "9.png"),
+    ]
+
+
+def test_prepare_frame_paths_clears_stale_frame_directory_before_extract(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(pipeline.settings, "frames_dir", tmp_path / "frames")
+
+    video_id = 7
+    source_path = tmp_path / "video.mp4"
+    source_path.write_bytes(b"video")
+    stale_dir = pipeline.settings.frames_dir / f"video_{video_id}"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    stale_file = stale_dir / "frame_000001.png"
+    stale_file.write_bytes(b"stale")
+
+    fresh_frame = stale_dir / "frame_000002.png"
+
+    def _extract(_video_path, output_dir, fps=1.0):
+        assert output_dir == stale_dir
+        assert not stale_file.exists()
+        fresh_frame.write_bytes(b"fresh")
+        return [fresh_frame]
+
+    monkeypatch.setattr(pipeline, "extract_frames_ffmpeg", _extract)
+
+    frame_paths = pipeline._prepare_frame_paths(video_id, source_path)
+
+    assert frame_paths == [fresh_frame]
+    assert not stale_file.exists()

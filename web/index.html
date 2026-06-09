@@ -43,6 +43,15 @@
         </section>
 
         <section class="panel">
+          <h2>Search Settings</h2>
+          <label class="toggle-row" for="openai-rerank-toggle">
+            <input id="openai-rerank-toggle" type="checkbox">
+            <span>Use OpenAI enhancements</span>
+          </label>
+          <p class="muted">Turn this off to run local-only search. Text search skips OpenAI parsing, expansion, and reranking. Question and video search skip OpenAI reranking.</p>
+        </section>
+
+        <section class="panel">
           <h2>Search By Text</h2>
           <form id="search-form" class="stack">
             <input id="query" name="query" placeholder="man fixing car">

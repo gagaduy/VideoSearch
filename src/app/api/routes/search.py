@@ -2,7 +2,7 @@ import inspect
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -16,12 +16,25 @@ router = APIRouter(tags=["search"])
 
 @router.post("/search", response_model=SearchResponse)
 def search(payload: SearchRequest, db: Session = Depends(get_db)) -> SearchResponse:
-    return SearchResponse.model_validate(run_search(db, payload.query, payload.object_labels))
+    return SearchResponse.model_validate(
+        run_search(
+            db,
+            payload.query,
+            payload.object_labels,
+            use_openai_rerank=payload.use_openai_rerank,
+        )
+    )
 
 
 @router.post("/search/question", response_model=SearchResponse)
 def search_by_question(payload: QuestionSearchRequest, db: Session = Depends(get_db)) -> SearchResponse:
-    return SearchResponse.model_validate(run_question_search(db, payload.question))
+    return SearchResponse.model_validate(
+        run_question_search(
+            db,
+            payload.question,
+            use_openai_rerank=payload.use_openai_rerank,
+        )
+    )
 
 
 @router.post("/search/image", response_model=SearchResponse)
@@ -46,9 +59,10 @@ async def search_by_image(
 @router.post("/search/video-query", response_model=SearchResponse)
 async def search_by_video_query(
     file: UploadFile = File(...),
+    use_openai_rerank: bool = Form(True),
     db: Session = Depends(get_db),
 ) -> SearchResponse:
-    result = run_video_query_search(db, file)
+    result = run_video_query_search(db, file, use_openai_rerank=use_openai_rerank)
     if inspect.isawaitable(result):
         result = await result
     return SearchResponse.model_validate(result)

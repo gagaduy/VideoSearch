@@ -161,9 +161,14 @@ def _collect_local_candidates(db: Session, query_frame_paths: list[Path]) -> lis
     return results
 
 
-def _apply_video_query_openai_rerank(query_frame_paths: list[Path], results: list[dict[str, object]]) -> list[dict[str, object]]:
+def _apply_video_query_openai_rerank(
+    query_frame_paths: list[Path],
+    results: list[dict[str, object]],
+    *,
+    use_openai_rerank: bool | None = None,
+) -> list[dict[str, object]]:
     if not should_run_openai_vision_rerank(
-        enabled=settings.openai_vision_rerank_enabled,
+        enabled=(settings.openai_enabled and settings.openai_vision_rerank_enabled) if use_openai_rerank is None else (settings.openai_enabled and use_openai_rerank),
         api_key=settings.openai_api_key,
         candidates=results,
     ):
@@ -195,7 +200,12 @@ def _apply_video_query_openai_rerank(query_frame_paths: list[Path], results: lis
     return sorted(updated, key=lambda item: float(item.get("score", 0.0)), reverse=True)
 
 
-async def run_video_query_search(db: Session, upload: UploadFile) -> dict[str, object]:
+async def run_video_query_search(
+    db: Session,
+    upload: UploadFile,
+    *,
+    use_openai_rerank: bool | None = None,
+) -> dict[str, object]:
     guessed_type = guess_type(upload.filename or "query.mp4")[0] or ""
     content_type = str(upload.content_type or "")
     if not content_type.startswith("video/") and not guessed_type.startswith("video/"):
@@ -219,7 +229,11 @@ async def run_video_query_search(db: Session, upload: UploadFile) -> dict[str, o
             frame_count=settings.video_query_frame_count,
         )
         results = _collect_local_candidates(db, query_frame_paths)
-        results = _apply_video_query_openai_rerank(query_frame_paths, results)
+        results = _apply_video_query_openai_rerank(
+            query_frame_paths,
+            results,
+            use_openai_rerank=use_openai_rerank,
+        )
         results = filter_result_payloads(results, threshold=settings.image_result_score_threshold)
         results = _normalize_public_scores(results)
         results = [{key: value for key, value in item.items() if key != "_image_path"} for item in results]

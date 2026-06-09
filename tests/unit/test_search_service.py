@@ -108,6 +108,7 @@ def test_run_image_search_returns_mode_and_filtered_results(monkeypatch) -> None
 
 def test_apply_openai_vision_rerank_updates_only_top_8(monkeypatch) -> None:
     rows = [{"frame_id": index + 1, "score": 0.8 - (index * 0.01)} for index in range(10)]
+    monkeypatch.setattr(search_service.settings, "openai_enabled", True)
     monkeypatch.setattr(search_service.settings, "openai_vision_rerank_enabled", True)
     monkeypatch.setattr(search_service.settings, "openai_api_key", "test-key")
     monkeypatch.setattr(search_service.settings, "openai_vision_rerank_top_k", 8)
@@ -127,6 +128,64 @@ def test_apply_openai_vision_rerank_updates_only_top_8(monkeypatch) -> None:
 
 def test_apply_openai_vision_rerank_returns_local_results_when_disabled(monkeypatch) -> None:
     rows = [{"frame_id": 1, "score": 0.6}]
+    monkeypatch.setattr(search_service.settings, "openai_enabled", True)
     monkeypatch.setattr(search_service.settings, "openai_vision_rerank_enabled", False)
 
     assert search_service._apply_openai_vision_rerank("query", rows) == rows
+
+
+def test_run_search_emits_debug_metrics_when_stage_timing_enabled(monkeypatch) -> None:
+    class _Db:
+        def commit(self):
+            return None
+
+    monkeypatch.setattr(search_service.settings, "enable_stage_timing", True)
+    monkeypatch.setattr(search_service.settings, "openai_enabled", False)
+    monkeypatch.setattr(
+        search_service,
+        "parse_structured_query",
+        lambda query, api_key, model: type(
+            "Structured",
+            (),
+            {
+                "semantic_query": query,
+                "semantic_queries": [query],
+                "object_filters": [],
+                "temporal_steps": [],
+                "model_dump": lambda self=None: {"semantic_query": query},
+            },
+        )(),
+    )
+    monkeypatch.setattr(search_service, "collect_branch_candidates", lambda *args, **kwargs: {"dense": []})
+    captured_logs: list[tuple[str, list[str], list[str], list[dict[str, object]]]] = []
+    monkeypatch.setattr(
+        search_service,
+        "create_query_log",
+        lambda db, query, expanded, object_labels, results: captured_logs.append((query, expanded, object_labels, results)),
+    )
+
+    payload = search_service.run_search(_Db(), "test query", [])
+
+    assert payload["results"] == []
+    assert "debug_metrics" in payload
+    assert "structured_query" in payload["debug_metrics"]["stage_timings"]
+    assert "collect_branch_candidates" in payload["debug_metrics"]["stage_timings"]
+    assert "total" in payload["debug_metrics"]["stage_timings"]
+    assert "rss_mb" in payload["debug_metrics"]
+
+
+def test_get_dense_encoder_reuses_single_adapter_instance(monkeypatch) -> None:
+    created: list[object] = []
+
+    class _Adapter:
+        def __init__(self) -> None:
+            created.append(self)
+
+    monkeypatch.setattr(search_service, "OpenClipAdapter", _Adapter)
+    search_service._SEARCH_DENSE_ENCODER = None
+
+    first = search_service._get_search_dense_encoder()
+    second = search_service._get_search_dense_encoder()
+
+    assert first is second
+    assert len(created) == 1
