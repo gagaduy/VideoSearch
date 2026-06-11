@@ -8,8 +8,8 @@ from worker.adapters.internvl_adapter import InternvlAdapter
 
 
 class CaptionAdapter:
-    def __init__(self, model_name: str | None = None) -> None:
-        self._local_adapter = InternvlAdapter()
+    def __init__(self, model_name: str | None = None, *, local_adapter: InternvlAdapter | None = None) -> None:
+        self._local_adapter = local_adapter or InternvlAdapter()
         self.model_name = model_name or settings.openai_model
 
     def caption(self, image_path: str) -> dict[str, object]:
@@ -47,3 +47,8 @@ class CaptionAdapter:
             except Exception:
                 pass
         return {"caption": "", "model_name": "disabled", "confidence": 0.0}
+
+    def close(self) -> None:
+        close = getattr(self._local_adapter, "close", None)
+        if callable(close):
+            close()

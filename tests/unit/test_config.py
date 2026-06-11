@@ -65,3 +65,41 @@ def test_question_search_defaults() -> None:
 
     assert settings.question_search_candidate_pool == 24
     assert settings.question_search_rerank_top_k == 8
+
+
+def test_settings_support_codetr_detector_family() -> None:
+    settings = Settings(
+        object_detector_family="codetr",
+        codetr_runtime_backend="subprocess",
+        codetr_repo_path="third_party/Co-DETR",
+        codetr_python_path=".codetr-cu121/bin/python",
+        codetr_config_path="configs/codetr.py",
+        codetr_checkpoint_path="weights/codetr.pth",
+        codetr_device="cuda:0",
+    )
+
+    assert settings.object_detector_family == "codetr"
+    assert settings.codetr_runtime_backend == "subprocess"
+    assert settings.codetr_repo_path == "third_party/Co-DETR"
+    assert settings.codetr_python_path == ".codetr-cu121/bin/python"
+    assert settings.codetr_config_path == "configs/codetr.py"
+    assert settings.codetr_checkpoint_path == "weights/codetr.pth"
+    assert settings.codetr_device == "cuda:0"
+
+
+def test_codetr_settings_support_real_model_paths() -> None:
+    settings = Settings(
+        object_detector_family="codetr",
+        codetr_runtime_backend="subprocess",
+        codetr_repo_path="third_party/Co-DETR",
+        codetr_python_path=".codetr-cu121/bin/python",
+        codetr_config_path="third_party/Co-DETR/projects/configs/co_dino/co_dino_5scale_r50_1x_coco.py",
+        codetr_checkpoint_path="models/codetr/co_dino_5scale_r50_1x_coco.pth",
+        codetr_device="cuda:0",
+    )
+
+    assert settings.codetr_runtime_backend == "subprocess"
+    assert settings.codetr_repo_path.endswith("Co-DETR")
+    assert settings.codetr_python_path.endswith("python")
+    assert settings.codetr_config_path.endswith(".py")
+    assert settings.codetr_checkpoint_path.endswith(".pth")

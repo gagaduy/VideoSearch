@@ -189,3 +189,157 @@ def test_get_dense_encoder_reuses_single_adapter_instance(monkeypatch) -> None:
 
     assert first is second
     assert len(created) == 1
+
+
+def test_prewarm_search_runtime_warms_dense_encoder_once(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class _Adapter:
+        def embed_text(self, text: str):
+            calls.append(text)
+            return type("Embedding", (), {"values": [0.1, 0.2, 0.3]})()
+
+    monkeypatch.setattr(search_service, "_get_search_dense_encoder", lambda: _Adapter())
+
+    search_service.prewarm_search_runtime()
+
+    assert calls == ["search runtime prewarm"]
+
+
+def test_normalize_score_map_scales_positive_values_to_zero_one() -> None:
+    normalized = search_service._normalize_score_map({11: 0.25, 12: 0.5, 13: 1.0})
+
+    assert normalized == {11: 0.25, 12: 0.5, 13: 1.0}
+
+
+def test_normalize_score_map_handles_uniform_positive_values() -> None:
+    normalized = search_service._normalize_score_map({11: 0.2, 12: 0.2})
+
+    assert normalized == {11: 1.0, 12: 1.0}
+
+
+def test_normalize_score_map_clamps_non_positive_values_to_zero() -> None:
+    normalized = search_service._normalize_score_map({11: 0.0, 12: -0.1})
+
+    assert normalized == {11: 0.0, 12: 0.0}
+
+
+def test_row_object_score_uses_semantic_aliases_and_region_constraints() -> None:
+    row = {
+        "labels": ["car"],
+        "object_counts": {"car": 1},
+        "object_positions": {"car": ["left", "middle"]},
+        "semantic_entities": [
+            {"label": "car", "aliases": ["sports car", "supercar"], "regions": ["left", "middle"]},
+        ],
+        "semantic_aliases": {"car": ["sports car", "supercar"]},
+        "semantic_counts": {"car": 1, "sports car": 1},
+    }
+
+    passed, score = search_service._row_object_score(
+        row,
+        [search_service.ObjectFilter(label="sports car", min_count=1, regions=["left"])],
+    )
+
+    assert passed is True
+    assert score == 1.0
+
+
+def test_row_object_score_rejects_wrong_region_even_when_label_matches() -> None:
+    row = {
+        "labels": ["car"],
+        "object_counts": {"car": 1},
+        "object_positions": {"car": ["right", "middle"]},
+        "semantic_entities": [],
+        "semantic_aliases": {},
+        "semantic_counts": {},
+    }
+
+    passed, score = search_service._row_object_score(
+        row,
+        [search_service.ObjectFilter(label="car", min_count=1, regions=["left"])],
+    )
+
+    assert passed is False
+    assert score == 0.0
+
+
+def test_row_object_score_prefers_exact_count_over_overcount_for_count_queries() -> None:
+    exact_row = {
+        "labels": ["car"],
+        "object_counts": {"car": 3},
+        "object_positions": {"car": ["center"]},
+        "semantic_entities": [],
+        "semantic_aliases": {},
+        "semantic_counts": {},
+    }
+    over_row = {
+        "labels": ["car"],
+        "object_counts": {"car": 5},
+        "object_positions": {"car": ["center"]},
+        "semantic_entities": [],
+        "semantic_aliases": {},
+        "semantic_counts": {},
+    }
+    object_filter = search_service.ObjectFilter(label="car", min_count=3)
+
+    exact_passed, exact_score = search_service._row_object_score(exact_row, [object_filter])
+    over_passed, over_score = search_service._row_object_score(over_row, [object_filter])
+
+    assert exact_passed is True
+    assert over_passed is True
+    assert exact_score == 1.0
+    assert 0.0 < over_score < exact_score
+
+
+def test_row_object_score_prefers_detector_counts_over_noisy_semantic_counts() -> None:
+    row = {
+        "labels": ["car"],
+        "object_counts": {"car": 3},
+        "object_positions": {"car": ["center"]},
+        "semantic_entities": [{"label": "sports", "aliases": ["driving"], "regions": []}],
+        "semantic_aliases": {"sports": ["driving"]},
+        "semantic_counts": {"sports": 1, "driving": 1},
+    }
+
+    passed, score = search_service._row_object_score(
+        row,
+        [search_service.ObjectFilter(label="car", min_count=3)],
+    )
+
+    assert passed is True
+    assert score == 1.0
+
+
+def test_entity_score_still_uses_semantic_aliases_after_detector_display_split() -> None:
+    row = {
+        "labels": ["car"],
+        "object_counts": {"car": 1},
+        "object_positions": {"car": ["center"]},
+        "semantic_entities": [{"label": "sports", "aliases": ["racecar"], "regions": []}],
+        "semantic_aliases": {"sports": ["racecar"]},
+        "semantic_counts": {"sports": 1, "racecar": 1},
+    }
+
+    score = search_service._entity_score(row, ["racecar"])
+
+    assert score == 1.0
+
+
+def test_row_count_refine_score_uses_detector_counts_for_count_queries() -> None:
+    row = {
+        "labels": ["car"],
+        "object_counts": {"car": 3},
+        "object_positions": {"car": ["center"]},
+        "semantic_entities": [{"label": "sports", "aliases": ["driving"], "regions": []}],
+        "semantic_aliases": {"sports": ["driving"]},
+        "semantic_counts": {"sports": 1, "driving": 1},
+    }
+
+    active, score = search_service._row_count_refine_score(
+        row,
+        [search_service.ObjectFilter(label="car", min_count=3)],
+    )
+
+    assert active is True
+    assert score == 1.0

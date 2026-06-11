@@ -33,6 +33,9 @@ def test_import_keyframe_dataset_indexes_existing_keyframes(monkeypatch, tmp_pat
         def embed_image(self, image_path: str) -> object:
             return type("Embedding", (), {"model_name": "stub", "values": [0.1, 0.2, 0.3]})()
 
+        def embed_images(self, image_paths: list[str]) -> list[object]:
+            return [self.embed_image(image_path) for image_path in image_paths]
+
         def embed_text(self, text: str) -> object:
             return type("Embedding", (), {"model_name": "stub", "values": [0.4, 0.5, 0.6]})()
 

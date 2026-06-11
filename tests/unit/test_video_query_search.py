@@ -5,8 +5,10 @@ import cv2
 import numpy as np
 from fastapi import UploadFile
 
+from app.services import video_query_search
 from app.services.video_query_search import (
     _extract_query_frames,
+    _collect_local_candidates,
     _normalize_public_scores,
     aggregate_query_frame_scores,
     run_video_query_search,
@@ -88,7 +90,7 @@ def test_run_video_query_search_returns_local_results_when_rerank_falls_back(mon
     )
     monkeypatch.setattr(
         "app.services.video_query_search._apply_video_query_openai_rerank",
-        lambda query_frame_paths, results: results,
+        lambda query_frame_paths, results, **kwargs: results,
     )
 
     upload = UploadFile(filename="query.mp4", file=query_path.open("rb"))
@@ -97,3 +99,47 @@ def test_run_video_query_search_returns_local_results_when_rerank_falls_back(mon
     assert payload["mode"] == "video"
     assert payload["results"][0]["frame_id"] == 11
     assert "_image_path" not in payload["results"][0]
+
+
+def test_collect_local_candidates_reuses_shared_dense_encoder(monkeypatch, tmp_path: Path) -> None:
+    frame_path = tmp_path / "query_frame.png"
+    frame_path.write_bytes(b"frame")
+
+    class _SharedEncoder:
+        def embed_images(self, image_paths: list[str]):
+            assert image_paths == [str(frame_path)]
+            return [type("Embedding", (), {"values": [0.1, 0.2, 0.3], "model_name": "stub"})()]
+
+    monkeypatch.setattr(video_query_search, "_get_search_dense_encoder", lambda: _SharedEncoder())
+    monkeypatch.setattr(
+        video_query_search,
+        "search_segment_candidates",
+        lambda db, query_embedding, limit: [
+            {
+                "segment_id": 11,
+                "video_id": 2,
+                "segment_index": 1,
+                "start_timestamp_sec": 3.0,
+                "end_timestamp_sec": 4.0,
+                "keyframe_id": 5,
+                "caption_text": "red car",
+                "ocr_text": "",
+                "labels": ["car"],
+                "object_counts": {"car": 1},
+                "object_positions": {"car": ["center"]},
+                "semantic_entities": [],
+                "semantic_counts": {},
+                "vector_distance": 0.42,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        video_query_search,
+        "fetch_frame_media_map",
+        lambda db, frame_ids: {5: {"image_path": "a.png", "thumb_path": "a.webp"}},
+    )
+
+    results = _collect_local_candidates(db=object(), query_frame_paths=[frame_path])
+
+    assert len(results) == 1
+    assert results[0]["frame_id"] == 5

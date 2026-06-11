@@ -66,3 +66,14 @@ def test_parse_structured_query_uses_local_temporal_and_object_heuristics_withou
     assert parsed.object_filters[0].min_count == 2
     assert "left" in parsed.object_filters[0].regions
     assert [step.text for step in parsed.temporal_steps] == ["two fish on the left", "shark on the right"]
+
+
+def test_parse_structured_query_singularizes_plural_count_object_labels_without_api() -> None:
+    parsed = parse_structured_query(
+        "three cars on a racetrack",
+        api_key="",
+        model="gpt-4.1-mini",
+    )
+
+    assert parsed.object_filters[0].label == "car"
+    assert parsed.object_filters[0].min_count == 3

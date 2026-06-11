@@ -1,51 +1,169 @@
 # Video Retrieval Quickstart
 
-## 1. Vao thu muc project
+README nay chi giu cac lenh chay hang ngay cho project.
+
+## 1. Vao project
 
 ```bash
 cd /home/duy/AI_Project/draft_v1
 ```
 
-## 2. Bat database
+## 2. Bat cac service nen
+
+### Chi can Postgres + Web
+
+Day la mode dung nhieu nhat:
 
 ```bash
-docker compose up -d postgres
+docker compose up -d postgres web
 docker compose ps
 ```
 
-Phai thay container `postgres` o trang thai `running`.
+Mac dinh:
+- Web: `http://localhost:8080`
+- Postgres: `localhost:5432`
 
-## 3. Chay API
+## 3. Chay API local
 
-Mo `terminal 1`:
-
-```bash
-conda run -p ./.conda env PYTHONPATH=src uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-Kiem tra nhanh:
+Khuyen nghi chay API local bang env `.conda`, khong dung `--reload` khi test that.
 
 ```bash
-curl http://localhost:8000/health
+PYTHONPATH=src ./.conda/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Neu OK thi se tra ve:
+Health check:
+
+```bash
+curl -sf http://localhost:8000/health
+```
+
+Ket qua dung:
 
 ```json
 {"status":"ok"}
 ```
 
-## 4. Chay worker
-
-Mo `terminal 2`:
+### Neu muon dung script
 
 ```bash
-conda run -p ./.conda env PYTHONPATH=src python -m worker.main
+bash scripts/run_api.sh
 ```
 
-Worker co the dung yen neu chua co `job`. Do la binh thuong.
+Luu y: script nay can `conda` shell function hoat dong. Neu shell bao `conda: command not found` thi dung lenh Python local o tren.
 
-## 5. Don sach database
+## 4. Chay worker
+
+Chi bat worker khi can import/index video moi.
+
+```bash
+PYTHONPATH=src ./.conda/bin/python -m worker.main
+```
+
+Hoac:
+
+```bash
+bash scripts/run_worker.sh
+```
+
+Neu chi test search tren du lieu da index san thi khong can worker.
+
+## 5. Chay du an theo 2 mode thuong dung
+
+### Mode A: Search-only
+
+```bash
+docker compose up -d postgres web
+PYTHONPATH=src ./.conda/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Mode nay nhe nhat de demo/search.
+
+### Mode B: Import / Index / Enrich
+
+Terminal 1:
+
+```bash
+docker compose up -d postgres web
+PYTHONPATH=src ./.conda/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Terminal 2:
+
+```bash
+PYTHONPATH=src ./.conda/bin/python -m worker.main
+```
+
+Mode nay dung khi import video moi.
+
+## 6. Bat full Docker stack
+
+Neu muon bat tat ca bang compose:
+
+```bash
+docker compose up -d
+docker compose ps --all
+```
+
+Luu y:
+- API trong Docker map ra cong `8001`
+- Web van o `8080`
+- Worker Docker nang hon, chi bat khi that su can
+
+Health check Docker API:
+
+```bash
+curl -sf http://localhost:8001/health
+```
+
+## 7. Import video moi
+
+Dang ky video:
+
+```bash
+curl -X POST http://localhost:8000/videos \
+  -H 'Content-Type: application/json' \
+  -d '{"filename":"sample.mp4","source_path":"/duong/dan/toi/sample.mp4"}'
+```
+
+Response se co `job.id`.
+
+Chay job:
+
+```bash
+curl -X POST http://localhost:8000/jobs/1/run
+```
+
+Thay `1` bang `job.id` that.
+
+Xem tien do:
+
+```bash
+curl http://localhost:8000/jobs/1
+```
+
+## 8. Search nhanh
+
+### Text search
+
+```bash
+curl -X POST http://localhost:8000/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"car near sign","object_labels":[]}'
+```
+
+### Video clip search
+
+Mo UI o:
+
+```text
+http://localhost:8080
+```
+
+Roi dung o `Search By Video Clip`.
+
+## 9. Reset du lieu DB
+
+Xoa sach du lieu retrieval:
 
 ```bash
 docker compose exec -T postgres psql -U video -d video_retrieval -c "TRUNCATE TABLE query_logs, index_jobs, frame_objects, frame_ocr, frame_captions, frame_embeddings, segments, frames, videos RESTART IDENTITY CASCADE;"
@@ -57,83 +175,50 @@ Kiem tra lai:
 docker compose exec -T postgres psql -U video -d video_retrieval -c "select (select count(*) from videos) as videos, (select count(*) from frames) as frames, (select count(*) from segments) as segments;"
 ```
 
-## 6. Import 1 clip nho de test
+## 10. Tat project
 
-Dang ky clip:
+### Neu chay local
 
-```bash
-curl -X POST http://localhost:8000/videos \
-  -H 'Content-Type: application/json' \
-  -d '{"filename":"sample.mp4","source_path":"/duong/dan/toi/sample.mp4"}'
-```
+- API / worker: `Ctrl+C` trong tung terminal
 
-Lenh tren se tra ve JSON co `job.id`.
-
-Chay job:
+### Neu chay Docker
 
 ```bash
-curl -X POST http://localhost:8000/jobs/1/run
+docker compose stop
 ```
 
-Thay `1` bang `job.id` that su.
-
-Kiem tra job:
+Hoac chi tat DB + web:
 
 ```bash
-curl http://localhost:8000/jobs/1
+docker compose stop postgres web
 ```
 
-## 7. Search thu
+## 11. Troubleshooting nhanh
+
+### API khong len
+
+Kiem tra DB truoc:
 
 ```bash
-curl -X POST http://localhost:8000/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"car near sign","object_labels":[]}'
+docker compose ps
+curl -sf http://localhost:8000/health
 ```
 
-## 8. Import keyframe dataset da extract san
+### Search duoc nhung import khong chay
 
-Lenh import:
+Kha nang cao la chua bat worker.
+
+### `conda: command not found`
+
+Dung lenh truc tiep voi Python trong env:
 
 ```bash
-conda run -p ./.conda env PYTHONPATH=src python scripts/import_keyframe_dataset.py /home/duy/Downloads/keyframe
+PYTHONPATH=src ./.conda/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+PYTHONPATH=src ./.conda/bin/python -m worker.main
 ```
 
-Luu y:
+### May bi lag
 
-- Dataset nay rat lon, import full se rat lau.
-- Khong duoc xuong dong sai cho. `python scripts/import_keyframe_dataset.py` phai nam tren cung mot lenh.
-- Neu muon chay nen va luu log:
-
-```bash
-nohup conda run -p ./.conda env PYTHONPATH=src python scripts/import_keyframe_dataset.py /home/duy/Downloads/keyframe > import_keyframe.log 2>&1 &
-tail -f import_keyframe.log
-```
-
-## 9. Kiem tra tien do import
-
-Xem process:
-
-```bash
-pgrep -af 'import_keyframe_dataset.py'
-```
-
-Xem DB da co bao nhieu ban ghi:
-
-```bash
-docker compose exec -T postgres psql -U video -d video_retrieval -c "select count(*) as total_videos, count(*) filter (where status='indexed') as indexed_videos, count(*) filter (where status='pending') as pending_videos from videos;"
-```
-
-```bash
-docker compose exec -T postgres psql -U video -d video_retrieval -c "select (select count(*) from frames) as frames, (select count(*) from segments) as segments;"
-```
-
-## 10. Neu muon tat
-
-Tat API va worker bang `Ctrl+C` trong tung terminal.
-
-Tat Postgres:
-
-```bash
-docker compose stop postgres
-```
+- Tat worker neu chi search
+- Khong dung `--reload` khi test that
+- Tranh bat dong thoi API local, API docker va worker neu khong can

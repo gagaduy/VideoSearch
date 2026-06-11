@@ -9,10 +9,12 @@ from worker import pipeline
 
 def test_run_index_pipeline_persists_frames_from_extracted_paths(monkeypatch, tmp_path: Path) -> None:
     session: Session = get_session_factory()()
+    original_detector_family = pipeline.settings.object_detector_family
     try:
         monkeypatch.setattr(pipeline.settings, "data_dir", tmp_path / "data")
         monkeypatch.setattr(pipeline.settings, "frames_dir", tmp_path / "frames")
         monkeypatch.setattr(pipeline.settings, "thumbs_dir", tmp_path / "thumbs")
+        monkeypatch.setattr(pipeline.settings, "object_detector_family", "yolo_world")
 
         video = Video(filename="real.mp4", source_path=str(tmp_path / "real.mp4"), status="pending")
         session.add(video)
@@ -69,7 +71,7 @@ def test_run_index_pipeline_persists_frames_from_extracted_paths(monkeypatch, tm
         monkeypatch.setattr(pipeline, "OpenClipAdapter", _OpenClip)
         monkeypatch.setattr(pipeline, "CaptionAdapter", _Caption)
         monkeypatch.setattr(pipeline, "PaddleOcrAdapter", _Ocr)
-        monkeypatch.setattr(pipeline, "YoloDetectionAdapter", _Detector)
+        monkeypatch.setattr(pipeline, "build_object_detector", lambda: _Detector())
         monkeypatch.setattr(pipeline, "InternvlAdapter", _InternVL)
 
         payload = pipeline.run_index_pipeline(session, int(video.id))
@@ -92,8 +94,89 @@ def test_run_index_pipeline_persists_frames_from_extracted_paths(monkeypatch, tm
         assert segment.ocr_tokens_json == ["text", "frame_000002"]
         assert segment.stage_failures_json == {}
         assert segment.raw_json["object_detector_family"] == "yolo_world"
+        assert segment.raw_json["object_detector_model"] == "stub-yolo-world"
         assert "" in segment.raw_json["object_prompt_set"]
     finally:
+        pipeline.settings.object_detector_family = original_detector_family
+        session.close()
+
+
+def test_run_index_pipeline_records_codetr_detector_family(monkeypatch, tmp_path: Path) -> None:
+    session: Session = get_session_factory()()
+    original_detector_family = pipeline.settings.object_detector_family
+    try:
+        monkeypatch.setattr(pipeline.settings, "data_dir", tmp_path / "data")
+        monkeypatch.setattr(pipeline.settings, "frames_dir", tmp_path / "frames")
+        monkeypatch.setattr(pipeline.settings, "thumbs_dir", tmp_path / "thumbs")
+        monkeypatch.setattr(pipeline.settings, "object_detector_family", "codetr")
+
+        video = Video(filename="codetr.mp4", source_path=str(tmp_path / "codetr.mp4"), status="pending")
+        session.add(video)
+        session.commit()
+
+        frame_path = tmp_path / "frame_000001.png"
+        frame_path.write_bytes(b"frame-one")
+
+        monkeypatch.setattr(pipeline, "_prepare_frame_paths", lambda video_id, source_path: [frame_path])
+        monkeypatch.setattr(pipeline, "keep_distinct_frames", lambda frames, distance_threshold: frames)
+        monkeypatch.setattr(
+            pipeline,
+            "copy_or_create_thumbnail",
+            lambda image_path, thumb_path: thumb_path.parent.mkdir(parents=True, exist_ok=True) or thumb_path.write_bytes(b"thumb") or thumb_path,
+        )
+
+        class _OpenClip:
+            def embed_image(self, image_path: str) -> object:
+                return type("Embedding", (), {"model_name": "stub", "values": [0.1, 0.2, 0.3]})()
+
+            def embed_images(self, image_paths: list[str]) -> list[object]:
+                return [self.embed_image(image_path) for image_path in image_paths]
+
+            def embed_text(self, text: str) -> object:
+                return type("Embedding", (), {"model_name": "stub", "values": [0.4, 0.5, 0.6]})()
+
+        class _Caption:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            def caption(self, image_path: str) -> dict[str, object]:
+                return {"caption": "", "model_name": "stub"}
+
+        class _Ocr:
+            engine_name = "stub-ocr"
+
+            def extract_text(self, image_path: str) -> dict[str, object]:
+                return {"text": "codetr text", "tokens": ["codetr", "text"], "raw": []}
+
+        class _Detector:
+            model_name = "co_detr_stub"
+
+            def detect(self, image_path: str, classes: list[str] | None = None) -> list[dict[str, object]]:
+                return [{"label": "car", "matched_prompt": "car", "score": 0.9, "bbox": [0, 0, 1, 1]}]
+
+        class _InternVL:
+            def describe_image(self, image_path: str) -> dict[str, object]:
+                return {
+                    "caption": "car on track",
+                    "tags": ["car"],
+                    "entities": [{"label": "car", "aliases": ["vehicle"]}],
+                    "model_name": "stub-internvl",
+                }
+
+        monkeypatch.setattr(pipeline, "OpenClipAdapter", _OpenClip)
+        monkeypatch.setattr(pipeline, "CaptionAdapter", _Caption)
+        monkeypatch.setattr(pipeline, "PaddleOcrAdapter", _Ocr)
+        monkeypatch.setattr(pipeline, "build_object_detector", lambda: _Detector())
+        monkeypatch.setattr(pipeline, "InternvlAdapter", _InternVL)
+
+        payload = pipeline.run_index_pipeline(session, int(video.id))
+
+        segment = session.query(Segment).filter(Segment.video_id == video.id).one()
+        assert segment.raw_json["object_detector_family"] == "codetr"
+        assert segment.raw_json["object_detector_model"] == "co_detr_stub"
+        assert "detector" in payload["stage_timings"]
+    finally:
+        pipeline.settings.object_detector_family = original_detector_family
         session.close()
 
 
@@ -164,7 +247,7 @@ def test_run_index_pipeline_reuses_single_vlm_pass_for_segment_enrichment(monkey
         monkeypatch.setattr(pipeline, "OpenClipAdapter", _OpenClip)
         monkeypatch.setattr(pipeline, "CaptionAdapter", _Caption)
         monkeypatch.setattr(pipeline, "PaddleOcrAdapter", _Ocr)
-        monkeypatch.setattr(pipeline, "YoloDetectionAdapter", _Detector)
+        monkeypatch.setattr(pipeline, "build_object_detector", lambda: _Detector())
         monkeypatch.setattr(pipeline, "SemanticEntityAdapter", _Semantic)
         monkeypatch.setattr(pipeline, "InternvlAdapter", _InternVL)
 
@@ -262,7 +345,7 @@ def test_run_index_pipeline_uses_sparse_vlm_enrichment_in_local_profile(monkeypa
         monkeypatch.setattr(pipeline, "OpenClipAdapter", _OpenClip)
         monkeypatch.setattr(pipeline, "CaptionAdapter", _Caption)
         monkeypatch.setattr(pipeline, "PaddleOcrAdapter", _Ocr)
-        monkeypatch.setattr(pipeline, "YoloDetectionAdapter", _Detector)
+        monkeypatch.setattr(pipeline, "build_object_detector", lambda: _Detector())
         monkeypatch.setattr(pipeline, "SemanticEntityAdapter", _Semantic)
         monkeypatch.setattr(pipeline, "InternvlAdapter", _InternVL)
 
@@ -351,7 +434,7 @@ def test_run_index_pipeline_leaves_semantic_fields_empty_when_vlm_selected_but_f
         monkeypatch.setattr(pipeline, "OpenClipAdapter", _OpenClip)
         monkeypatch.setattr(pipeline, "CaptionAdapter", _Caption)
         monkeypatch.setattr(pipeline, "PaddleOcrAdapter", _Ocr)
-        monkeypatch.setattr(pipeline, "YoloDetectionAdapter", _Detector)
+        monkeypatch.setattr(pipeline, "build_object_detector", lambda: _Detector())
         monkeypatch.setattr(pipeline, "SemanticEntityAdapter", _Semantic)
         monkeypatch.setattr(pipeline, "InternvlAdapter", _InternVL)
 
@@ -415,6 +498,9 @@ def test_index_prepared_frames_batches_openclip_image_embedding(monkeypatch, tmp
                 return type("Embedding", (), {"model_name": "stub", "values": [0.4, 0.5, 0.6]})()
 
         class _Caption:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
             def caption(self, image_path: str) -> dict[str, object]:
                 return {"caption": "", "model_name": "stub"}
 
@@ -491,6 +577,9 @@ def test_run_index_pipeline_returns_stage_timings(monkeypatch, tmp_path: Path) -
                 return type("Embedding", (), {"model_name": "stub", "values": [0.4, 0.5, 0.6]})()
 
         class _Caption:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
             def caption(self, image_path: str) -> dict[str, object]:
                 return {"caption": "", "model_name": "stub"}
 
@@ -518,7 +607,7 @@ def test_run_index_pipeline_returns_stage_timings(monkeypatch, tmp_path: Path) -
         monkeypatch.setattr(pipeline, "OpenClipAdapter", _OpenClip)
         monkeypatch.setattr(pipeline, "CaptionAdapter", _Caption)
         monkeypatch.setattr(pipeline, "PaddleOcrAdapter", _Ocr)
-        monkeypatch.setattr(pipeline, "YoloDetectionAdapter", _Detector)
+        monkeypatch.setattr(pipeline, "build_object_detector", lambda: _Detector())
         monkeypatch.setattr(pipeline, "InternvlAdapter", _InternVL)
 
         payload = pipeline.run_index_pipeline(session, int(video.id))
@@ -530,5 +619,111 @@ def test_run_index_pipeline_returns_stage_timings(monkeypatch, tmp_path: Path) -
         assert "detector" in payload["stage_timings"]
         assert "branch_b" in payload["stage_timings"]
         assert "stage_timings" in segment.raw_json
+    finally:
+        session.close()
+
+
+def test_index_prepared_frames_releases_gpu_heavy_adapters_between_phases(monkeypatch, tmp_path: Path) -> None:
+    session: Session = get_session_factory()()
+    try:
+        video = Video(filename="phased.mp4", source_path=str(tmp_path / "phased.mp4"), status="pending")
+        session.add(video)
+        session.commit()
+
+        frame_path = tmp_path / "frame_000001.png"
+        frame_path.write_bytes(b"frame-one")
+
+        actions: list[str] = []
+
+        class _OpenClip:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def embed_images(self, image_paths: list[str]) -> list[object]:
+                actions.append("openclip.embed_images")
+                return [type("Embedding", (), {"model_name": "stub", "values": [0.1, 0.2, 0.3]})() for _ in image_paths]
+
+            def embed_text(self, text: str) -> object:
+                assert internvl.closed, "branch_b text embedding should run only after InternVL is released"
+                actions.append("openclip.embed_text")
+                return type("Embedding", (), {"model_name": "stub", "values": [0.4, 0.5, 0.6]})()
+
+            def close(self) -> None:
+                self.closed = True
+                actions.append("openclip.close")
+
+        class _Caption:
+            def caption(self, image_path: str) -> dict[str, object]:
+                actions.append("caption.caption")
+                return {"caption": "", "model_name": "stub"}
+
+            def close(self) -> None:
+                actions.append("caption.close")
+
+        class _Ocr:
+            engine_name = "stub-ocr"
+
+            def extract_text(self, image_path: str) -> dict[str, object]:
+                actions.append("ocr.extract")
+                return {"text": "timed text", "tokens": ["timed", "text"], "raw": []}
+
+        class _Detector:
+            model_name = "stub-codetr"
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            def detect(self, image_path: str, classes: list[str] | None = None) -> list[dict[str, object]]:
+                assert openclip.closed, "image embedding adapter should be released before detector phase"
+                actions.append("detector.detect")
+                return [{"label": "car", "matched_prompt": "car", "score": 0.9, "bbox": [0, 0, 1, 1]}]
+
+            def close(self) -> None:
+                self.closed = True
+                actions.append("detector.close")
+
+        class _Semantic:
+            def extract(self, image_path: str, caption_text: str, ocr_text: str) -> dict[str, object]:
+                actions.append("semantic.extract")
+                return {"entities": [], "counts": {}}
+
+        class _InternVL:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def describe_image(self, image_path: str) -> dict[str, object]:
+                assert detector.closed, "detector should be released before VLM phase"
+                actions.append("internvl.describe")
+                return {
+                    "caption": "a black sports car",
+                    "tags": ["car"],
+                    "entities": [{"label": "car", "aliases": ["vehicle"]}],
+                    "model_name": "stub-internvl",
+                }
+
+            def close(self) -> None:
+                self.closed = True
+                actions.append("internvl.close")
+
+        openclip = _OpenClip()
+        detector = _Detector()
+        internvl = _InternVL()
+
+        payload = pipeline.index_prepared_frames(
+            session,
+            int(video.id),
+            [{"image_path": str(frame_path), "timestamp_sec": 0.0, "frame_index": 1}],
+            openclip=openclip,
+            captioner=_Caption(),
+            ocr_engine=_Ocr(),
+            detector=detector,
+            entity_extractor=_Semantic(),
+            branch_b_adapter=internvl,
+        )
+
+        assert payload["segment_count"] == 1
+        assert actions.index("openclip.close") < actions.index("detector.detect")
+        assert actions.index("detector.close") < actions.index("internvl.describe")
+        assert actions.index("internvl.close") < actions.index("openclip.embed_text")
     finally:
         session.close()

@@ -2,6 +2,7 @@ import shutil
 from math import sqrt
 from pathlib import Path
 from time import perf_counter
+from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -10,11 +11,11 @@ from app.config import settings
 from app.db.models import Frame, FrameCaption, FrameEmbedding, FrameObject, FrameOcr, IndexJob, Segment, Video
 from app.services.storage import ensure_data_dirs
 from worker.adapters.caption_adapter import CaptionAdapter
+from worker.adapters.detector_factory import build_object_detector
 from worker.adapters.internvl_adapter import InternvlAdapter
 from worker.adapters.openclip_adapter import OpenClipAdapter
 from worker.adapters.paddleocr_adapter import PaddleOcrAdapter
 from worker.adapters.semantic_entity_adapter import SemanticEntityAdapter
-from worker.adapters.yolo_adapter import YoloDetectionAdapter
 from worker.io import copy_or_create_thumbnail, extract_frames_ffmpeg, write_placeholder_image
 from worker.retrieval_ontology import build_indexing_prompts
 from worker.sampling import keep_distinct_frames
@@ -108,6 +109,22 @@ def _record_stage_timing(timings: dict[str, dict[str, float | int]], stage: str,
     bucket = timings.setdefault(stage, {"count": 0, "total_sec": 0.0})
     bucket["count"] = int(bucket["count"]) + 1
     bucket["total_sec"] = round(float(bucket["total_sec"]) + elapsed_sec, 6)
+
+
+def _safe_close_adapter(adapter: object) -> None:
+    close = getattr(adapter, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def _build_caption_adapter(branch_b_adapter: InternvlAdapter) -> CaptionAdapter:
+    try:
+        return CaptionAdapter(local_adapter=branch_b_adapter)
+    except TypeError:
+        return CaptionAdapter()
 
 
 def _should_run_vlm_enrichment(
@@ -235,7 +252,7 @@ def index_prepared_frames(
     openclip: OpenClipAdapter,
     captioner: CaptionAdapter,
     ocr_engine: PaddleOcrAdapter,
-    detector: YoloDetectionAdapter,
+    detector: Any,
     entity_extractor: SemanticEntityAdapter,
     branch_b_adapter: InternvlAdapter,
     job_id: int | None = None,
@@ -308,6 +325,7 @@ def index_prepared_frames(
 
     _update_job_stage(db, job_id, status="running", stage="building_segments")
     segments = _persist_segments(db, video_id, frame_items)
+    _safe_close_adapter(openclip)
     _update_job_stage(db, job_id, status="running", stage=f"enriching_segments:0/{len(segments)}")
     last_caption, last_ocr, last_objects = _enrich_segment_keyframes(
         db,
@@ -396,7 +414,7 @@ def _enrich_segment_keyframes(
     *,
     captioner: CaptionAdapter,
     ocr_engine: PaddleOcrAdapter,
-    detector: YoloDetectionAdapter,
+    detector: Any,
     entity_extractor: SemanticEntityAdapter,
     branch_b_adapter: InternvlAdapter,
     dense_encoder: OpenClipAdapter,
@@ -436,7 +454,6 @@ def _enrich_segment_keyframes(
         if settings.enable_stage_timing:
             _record_stage_timing(stage_timings, "detector", perf_counter() - detector_started)
         object_positions = _object_positions(objects, image_path)
-
         use_vlm = _should_run_vlm_enrichment(
             segment_index=index,
             segment_count=len(segments),
@@ -445,6 +462,68 @@ def _enrich_segment_keyframes(
             ocr_text=str(ocr["text"]),
             objects=objects,
         )
+
+        payload["ocr"] = ocr
+        payload["objects"] = objects
+        payload["object_positions"] = object_positions
+        payload["use_vlm"] = use_vlm
+        payload["stage_failures"] = stage_failures
+
+        db.add(
+            FrameOcr(
+                frame_id=frame.id,
+                engine_name=ocr_engine.engine_name,
+                text=str(ocr["text"]),
+                raw_json={"raw": ocr["raw"]},
+            )
+        )
+        for item in objects:
+            db.add(
+                FrameObject(
+                    frame_id=frame.id,
+                    detector_name=detector.model_name,
+                    label=str(item["label"]),
+                    score=float(item["score"]),
+                    bbox=[float(value) for value in item["bbox"]],
+                    raw_json=item,
+                )
+            )
+
+        segment.ocr_text = str(ocr["text"])
+        segment.ocr_tokens_json = list(ocr.get("tokens", []))
+        counts = _object_counts(objects)
+        segment.object_labels_json = sorted(counts)
+        segment.object_counts_json = counts
+        segment.object_positions_json = object_positions
+        segment.raw_json = {
+            **dict(segment.raw_json or {}),
+            "object_prompt_set": object_prompts,
+            "object_detector_family": settings.object_detector_family.strip().lower(),
+            "object_detector_model": getattr(detector, "model_name", detector.__class__.__name__),
+        }
+        if settings.enable_stage_timing:
+            segment.raw_json = {**dict(segment.raw_json or {}), "stage_timings": stage_timings}
+        if job is not None:
+            job.status = "running"
+            job.stage = f"enriching_objects:{index}/{len(segments)}"
+        if _should_commit_progress(index=index, total=len(segments), interval=enrich_commit_interval):
+            commit_started = perf_counter()
+            db.commit()
+            if settings.enable_stage_timing:
+                _record_stage_timing(stage_timings, "enrich_commit", perf_counter() - commit_started)
+
+    db.commit()
+    _safe_close_adapter(detector)
+
+    for index, payload in enumerate(enrich_inputs, start=1):
+        segment = payload["segment"]
+        frame = payload["frame"]
+        image_path = str(payload["image_path"])
+        ocr = payload["ocr"]
+        objects = payload["objects"]
+        object_positions = payload["object_positions"]
+        use_vlm = bool(payload["use_vlm"])
+        stage_failures = dict(payload["stage_failures"])
 
         branch_b: dict[str, object] = {"caption": "", "tags": [], "entities": [], "model_name": ""}
         branch_b_started = perf_counter()
@@ -538,33 +617,8 @@ def _enrich_segment_keyframes(
                 confidence=float(caption.get("confidence", 1.0)) if caption.get("caption") else 0.0,
             )
         )
-        db.add(
-            FrameOcr(
-                frame_id=frame.id,
-                engine_name=ocr_engine.engine_name,
-                text=str(ocr["text"]),
-                raw_json={"raw": ocr["raw"]},
-            )
-        )
-        for item in objects:
-            db.add(
-                FrameObject(
-                    frame_id=frame.id,
-                    detector_name=detector.model_name,
-                    label=str(item["label"]),
-                    score=float(item["score"]),
-                    bbox=[float(value) for value in item["bbox"]],
-                    raw_json=item,
-                )
-            )
 
         segment.caption_text = str(caption["caption"])
-        segment.ocr_text = str(ocr["text"])
-        segment.ocr_tokens_json = list(ocr.get("tokens", []))
-        counts = _object_counts(objects)
-        segment.object_labels_json = sorted(counts)
-        segment.object_counts_json = counts
-        segment.object_positions_json = object_positions
         segment.semantic_entities_json = list(semantic.get("entities", []))
         segment.semantic_aliases_json = {
             str(item.get("label", "")).strip().lower(): [
@@ -576,41 +630,54 @@ def _enrich_segment_keyframes(
             if str(item.get("label", "")).strip()
         }
         segment.semantic_counts_json = dict(semantic.get("counts", {}))
-        branch_b_text = _unique_text(
+        segment.stage_failures_json = stage_failures
+        payload["branch_b_text"] = _unique_text(
             [
                 str(branch_b.get("caption", "")),
                 *[str(tag) for tag in branch_b.get("tags", [])],
                 *[str(item.get("label", "")) for item in branch_b.get("entities", [])],
             ]
         )
-        if branch_b_text:
-            branch_b_embed_started = perf_counter()
-            segment.embedding_branch_b = dense_encoder.embed_text(branch_b_text).values
-            if settings.enable_stage_timing:
-                _record_stage_timing(stage_timings, "branch_b_embedding", perf_counter() - branch_b_embed_started)
-        segment.stage_failures_json = stage_failures
-        segment.raw_json = {
-            **dict(segment.raw_json or {}),
-            "object_prompt_set": object_prompts,
-            "object_detector_family": "yolo_world",
-        }
-
-        last_caption = str(caption["caption"])
-        last_ocr = str(ocr["text"])
-        last_objects = objects
         if settings.enable_stage_timing:
-            segment.raw_json = {
-                **dict(segment.raw_json or {}),
-                "stage_timings": stage_timings,
-            }
+            segment.raw_json = {**dict(segment.raw_json or {}), "stage_timings": stage_timings}
         if job is not None:
             job.status = "running"
-            job.stage = f"enriching_segments:{index}/{len(segments)}"
+            job.stage = f"enriching_vlm:{index}/{len(segments)}"
         if _should_commit_progress(index=index, total=len(segments), interval=enrich_commit_interval):
             commit_started = perf_counter()
             db.commit()
             if settings.enable_stage_timing:
                 _record_stage_timing(stage_timings, "enrich_commit", perf_counter() - commit_started)
+
+        last_caption = str(caption["caption"])
+        last_ocr = str(ocr["text"])
+        last_objects = objects
+
+    db.commit()
+    _safe_close_adapter(captioner)
+    _safe_close_adapter(branch_b_adapter)
+
+    for index, payload in enumerate(enrich_inputs, start=1):
+        segment = payload["segment"]
+        branch_b_text = str(payload.get("branch_b_text", "")).strip()
+        if branch_b_text:
+            branch_b_embed_started = perf_counter()
+            segment.embedding_branch_b = dense_encoder.embed_text(branch_b_text).values
+            if settings.enable_stage_timing:
+                _record_stage_timing(stage_timings, "branch_b_embedding", perf_counter() - branch_b_embed_started)
+        if settings.enable_stage_timing:
+            segment.raw_json = {**dict(segment.raw_json or {}), "stage_timings": stage_timings}
+        if job is not None:
+            job.status = "running"
+            job.stage = f"embedding_branch_b:{index}/{len(segments)}"
+        if _should_commit_progress(index=index, total=len(segments), interval=enrich_commit_interval):
+            commit_started = perf_counter()
+            db.commit()
+            if settings.enable_stage_timing:
+                _record_stage_timing(stage_timings, "enrich_commit", perf_counter() - commit_started)
+
+    db.commit()
+    _safe_close_adapter(dense_encoder)
 
     return last_caption, last_ocr, last_objects
 
@@ -623,32 +690,38 @@ def run_index_pipeline(db: Session, video_id: int, job_id: int | None = None) ->
     ensure_data_dirs()
     source_path = Path(video.source_path)
     openclip = OpenClipAdapter()
-    captioner = CaptionAdapter()
     ocr_engine = PaddleOcrAdapter()
-    detector = YoloDetectionAdapter()
+    detector = build_object_detector()
     entity_extractor = SemanticEntityAdapter()
     branch_b_adapter = InternvlAdapter()
+    captioner = _build_caption_adapter(branch_b_adapter)
 
     _update_job_stage(db, job_id, status="running", stage="extracting_frames")
     frame_paths = keep_distinct_frames(_prepare_frame_paths(video_id, source_path), distance_threshold=8)
     if not frame_paths:
         raise RuntimeError(f"no frames extracted for video {video_id}")
-    payload = index_prepared_frames(
-        db,
-        video_id,
-        [
-            {"image_path": str(frame_path), "timestamp_sec": float(index - 1), "frame_index": index}
-            for index, frame_path in enumerate(frame_paths, start=1)
-        ],
-        openclip=openclip,
-        captioner=captioner,
-        ocr_engine=ocr_engine,
-        detector=detector,
-        entity_extractor=entity_extractor,
-        branch_b_adapter=branch_b_adapter,
-        job_id=job_id,
-        source_tag="video_extract",
-    )
+    try:
+        payload = index_prepared_frames(
+            db,
+            video_id,
+            [
+                {"image_path": str(frame_path), "timestamp_sec": float(index - 1), "frame_index": index}
+                for index, frame_path in enumerate(frame_paths, start=1)
+            ],
+            openclip=openclip,
+            captioner=captioner,
+            ocr_engine=ocr_engine,
+            detector=detector,
+            entity_extractor=entity_extractor,
+            branch_b_adapter=branch_b_adapter,
+            job_id=job_id,
+            source_tag="video_extract",
+        )
+    finally:
+        _safe_close_adapter(openclip)
+        _safe_close_adapter(detector)
+        _safe_close_adapter(captioner)
+        _safe_close_adapter(branch_b_adapter)
     video.status = "indexed"
     if job_id is not None:
         job = db.get(IndexJob, job_id)

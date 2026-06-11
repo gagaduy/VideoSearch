@@ -15,7 +15,7 @@ from worker.adapters.openclip_adapter import OpenClipAdapter
 from worker.adapters.paddleocr_adapter import PaddleOcrAdapter
 from worker.adapters.semantic_entity_adapter import SemanticEntityAdapter
 from worker.adapters.yolo_adapter import YoloDetectionAdapter
-from worker.pipeline import index_prepared_frames
+from worker.pipeline import _build_caption_adapter, index_prepared_frames
 
 
 @dataclass(slots=True)
@@ -98,11 +98,11 @@ def import_keyframe_dataset(db: Session, dataset_root: str | Path) -> dict[str, 
     ensure_data_dirs()
     sources = discover_keyframe_videos(dataset_root)
     openclip = OpenClipAdapter()
-    captioner = CaptionAdapter()
     ocr_engine = PaddleOcrAdapter()
     detector = YoloDetectionAdapter()
     entity_extractor = SemanticEntityAdapter()
     branch_b_adapter = InternvlAdapter()
+    captioner = _build_caption_adapter(branch_b_adapter)
 
     imported_videos = 0
     imported_frames = 0

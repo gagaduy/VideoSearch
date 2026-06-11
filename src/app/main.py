@@ -10,11 +10,13 @@ from app.api.routes.media import router as media_router
 from app.api.routes.search import router as search_router
 from app.api.routes.videos import router as videos_router
 from app.db.session import init_db
+from app.services.search_service import prewarm_search_runtime
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     init_db()
+    prewarm_search_runtime()
     yield
 
 

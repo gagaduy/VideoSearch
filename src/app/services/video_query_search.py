@@ -18,8 +18,7 @@ from app.services.openai_vision_rerank import (
     select_rerank_candidates,
     should_run_openai_vision_rerank,
 )
-from app.services.search_service import build_visual_search_result, filter_result_payloads
-from worker.adapters.openclip_adapter import OpenClipAdapter
+from app.services.search_service import _get_search_dense_encoder, build_visual_search_result, filter_result_payloads
 
 
 def validate_query_clip_duration(duration_sec: float, max_duration_sec: float) -> bool:
@@ -112,7 +111,7 @@ def _extract_query_frames(video_path: Path, output_dir: Path, frame_count: int) 
 
 
 def _collect_local_candidates(db: Session, query_frame_paths: list[Path]) -> list[dict[str, object]]:
-    embeddings = OpenClipAdapter().embed_images([str(path) for path in query_frame_paths])
+    embeddings = _get_search_dense_encoder().embed_images([str(path) for path in query_frame_paths])
     rows_by_segment: dict[int, dict[str, object]] = {}
     per_query_scores: list[dict[int, float]] = []
 

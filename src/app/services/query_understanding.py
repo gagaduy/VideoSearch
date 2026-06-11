@@ -7,6 +7,8 @@ from typing import Any
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from worker.retrieval_ontology import canonicalize_object_label
+
 
 class ObjectFilter(BaseModel):
     label: str
@@ -91,6 +93,7 @@ def _extract_object_filters(text: str) -> list[ObjectFilter]:
             label = tokens[index + 1]
             if label in _STOPWORDS or label in _REGIONS or label in _NUMBER_WORDS:
                 continue
+            label = canonicalize_object_label(label)
             min_count = _NUMBER_WORDS[token] if token in _NUMBER_WORDS else int(token)
             filters.append(ObjectFilter(label=label, min_count=min_count, regions=regions))
             break
@@ -101,7 +104,7 @@ def _extract_object_filters(text: str) -> list[ObjectFilter]:
     for token in tokens:
         if token in _STOPWORDS or token in _REGIONS or token in _NUMBER_WORDS:
             continue
-        filters.append(ObjectFilter(label=token, min_count=1, regions=regions))
+        filters.append(ObjectFilter(label=canonicalize_object_label(token), min_count=1, regions=regions))
         break
     return filters
 

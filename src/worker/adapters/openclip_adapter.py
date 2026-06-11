@@ -79,3 +79,22 @@ class OpenClipAdapter:
 
     def embed_image(self, image_path: str) -> EmbeddingResult:
         return self.embed_images([image_path])[0]
+
+    def close(self) -> None:
+        self._model = None
+        self._preprocess = None
+        self._tokenizer = None
+        self._device = "cpu"
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass

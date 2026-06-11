@@ -101,7 +101,7 @@ def _stub_indexing_runtime(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(pipeline, "OpenClipAdapter", _OpenClip)
     monkeypatch.setattr(pipeline, "CaptionAdapter", _Caption)
     monkeypatch.setattr(pipeline, "PaddleOcrAdapter", _Ocr)
-    monkeypatch.setattr(pipeline, "YoloDetectionAdapter", _Detector)
+    monkeypatch.setattr(pipeline, "build_object_detector", lambda: _Detector())
     monkeypatch.setattr(pipeline, "InternvlAdapter", _InternVL)
     monkeypatch.setattr(search_service, "run_openai_vision_rerank", lambda query, candidates, query_image_paths=None: {})
     monkeypatch.setattr(question_search, "run_openai_vision_rerank", lambda query, candidates, query_image_paths=None: {})
@@ -132,6 +132,8 @@ def test_search_endpoint_returns_ranked_results(monkeypatch, tmp_path: Path) -> 
     assert payload["results"][0]["preview_url"].startswith("/media/frames/")
     assert isinstance(payload["results"][0]["object_counts"], dict)
     assert "object_refinement_score" in payload["results"][0]["diagnostics"]
+    assert payload["results"][0]["diagnostics"]["object_detector_family"] == search_service.settings.object_detector_family
+    assert payload["results"][0]["diagnostics"]["object_detector_model"] == "stub-yolo-world"
 
 
 def test_search_endpoint_applies_query_conditioned_object_refinement(monkeypatch, tmp_path: Path) -> None:

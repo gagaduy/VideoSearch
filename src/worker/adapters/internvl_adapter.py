@@ -37,7 +37,7 @@ class InternvlAdapter:
             return self._model, self._tokenizer
 
         import torch
-        from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
+        from transformers import AutoModel, AutoTokenizer
 
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         model_kwargs: dict[str, Any] = {
@@ -48,7 +48,12 @@ class InternvlAdapter:
         }
         quantized_kwargs: dict[str, Any] = dict(model_kwargs)
         if self.load_in_8bit and torch.cuda.is_available():
-            quantized_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            try:
+                from transformers import BitsAndBytesConfig
+
+                quantized_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+            except Exception:
+                quantized_kwargs = dict(model_kwargs)
 
         try:
             if self.load_in_8bit and torch.cuda.is_available():
@@ -216,3 +221,20 @@ class InternvlAdapter:
                 "image_path": image_path,
                 "raw_text": fallback_text,
             }
+
+    def close(self) -> None:
+        self._model = None
+        self._tokenizer = None
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass

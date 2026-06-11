@@ -4,10 +4,26 @@ import re
 
 CANONICAL_OBJECTS: dict[str, list[str]] = {
     "person": ["human", "man", "woman", "people"],
-    "car": ["automobile", "sedan", "taxi"],
+    "car": [
+        "automobile",
+        "sedan",
+        "taxi",
+        "sports car",
+        "sportscar",
+        "race car",
+        "racecar",
+        "supercar",
+        "convertible",
+        "tesla",
+        "lamborghini",
+        "ferrari",
+        "porsche",
+        "vehicle",
+    ],
     "boat": ["ship", "vessel"],
     "bicycle": ["bike"],
     "motorcycle": ["motorbike"],
+    "airplane": ["plane", "aircraft", "jet"],
     "phone": ["smartphone", "mobile phone"],
     "laptop": ["notebook computer"],
     "screen": ["display", "monitor"],
@@ -74,6 +90,18 @@ def canonicalize_object_label(label: str) -> str:
             return canonical
         if normalized in {_normalize_term(alias) for alias in aliases}:
             return canonical
+    if normalized.endswith("ies") and len(normalized) > 3:
+        singular = normalized[:-3] + "y"
+        if singular in CANONICAL_OBJECTS:
+            return singular
+    if normalized.endswith("es") and len(normalized) > 2:
+        singular = normalized[:-2]
+        if singular in CANONICAL_OBJECTS:
+            return singular
+    if normalized.endswith("s") and len(normalized) > 1:
+        singular = normalized[:-1]
+        if singular in CANONICAL_OBJECTS:
+            return singular
     return normalized
 
 
